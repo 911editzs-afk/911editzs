@@ -1551,24 +1551,30 @@ async def setxp_cmd(
 @tree.command(name="importlevels", description="Import the levels exported from DraftBot")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
+@tree.command(name="importlevels", description="Import the levels exported from DraftBot")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 async def importlevels_cmd(interaction: discord.Interaction):
     global _niveaux_modifies
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Administrators only.", ephemeral=True)
         return
-    if not os.path.exists(FICHIER_IMPORT):
-        await interaction.response.send_message(
-            f"`{FICHIER_IMPORT}` not found. Put it in the same folder as the bot.", ephemeral=True
-        )
-        return
 
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+
+    # Charge via storage (MongoDB sur Render, fichier local en dev)
     try:
-        with open(FICHIER_IMPORT, "r", encoding="utf-8") as f:
-            lignes = json.load(f)
+        lignes = storage.charger(FICHIER_IMPORT, defaut=None)
     except Exception as e:
         await interaction.followup.send(f"Couldn't read `{FICHIER_IMPORT}`: {e}", ephemeral=True)
+        return
+
+    if not lignes:
+        await interaction.followup.send(
+            f"`{FICHIER_IMPORT}` not found (neither in MongoDB nor on disk).",
+            ephemeral=True,
+        )
         return
 
     donnees = NIVEAUX.setdefault(str(guild.id), {})
@@ -1578,6 +1584,7 @@ async def importlevels_cmd(interaction: discord.Interaction):
         donnees[uid] = max(donnees.get(uid, 0), int(l["xp"]))  # on ne fait jamais baisser un niveau
         if guild.get_member(int(uid)) is None:
             absents += 1
+
     _niveaux_modifies = True
     sauver_niveaux()
 
@@ -1592,8 +1599,6 @@ async def importlevels_cmd(interaction: discord.Interaction):
             f"join, but they won't show up in `/leaderboard`."
         )
     await interaction.followup.send(texte, ephemeral=True)
-
-
 # ---------- FILTRE ----------
 @client.event
 async def on_message(message):
