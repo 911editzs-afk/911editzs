@@ -1560,38 +1560,34 @@ async def importlevels_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
-
-    # Charger l'export depuis storage (MongoDB sur Render, fichier local en dev).
+    # Read the import through the same storage backend as the bot (MongoDB on Render).
     try:
-        lignes = storage.charger(FICHIER_IMPORT, defaut=None)
+        lignes = storage.charger(FICHIER_IMPORT)
     except Exception as e:
         await interaction.followup.send(
-            f"Couldn't read `{FICHIER_IMPORT}` from storage: {e}", ephemeral=True
+            f"Storage error while loading `{FICHIER_IMPORT}`: {e}", ephemeral=True
         )
         return
 
 
     if not lignes:
         await interaction.followup.send(
-            f"`{FICHIER_IMPORT}` not found (neither in MongoDB nor on disk).",
+            f"No data named `{FICHIER_IMPORT}` was found in the bot storage. "
+            "The import file must first be saved to MongoDB using the storage system.",
             ephemeral=True,
         )
         return
 
-
-    # L'export DraftBot attendu est une liste d'objets {id, xp}.
     if not isinstance(lignes, list):
         await interaction.followup.send(
-            f"Invalid format for `{FICHIER_IMPORT}`: expected a JSON list of entries containing `id` and `xp`.",
+            f"Invalid `{FICHIER_IMPORT}` format: expected a JSON list of entries with `id` and `xp`.",
             ephemeral=True,
         )
         return
 
 
     donnees = NIVEAUX.setdefault(str(guild.id), {})
-    absents = 0
-    importes = 0
-    invalides = 0
+    absents = importes = invalides = 0
     for ligne in lignes:
         if not isinstance(ligne, dict) or "id" not in ligne or "xp" not in ligne:
             invalides += 1
@@ -1600,37 +1596,27 @@ async def importlevels_cmd(interaction: discord.Interaction):
             uid = str(int(ligne["id"]))
             xp = int(ligne["xp"])
             if xp < 0:
-                raise ValueError("XP cannot be negative")
+                raise ValueError("negative XP")
         except (TypeError, ValueError, OverflowError):
             invalides += 1
             continue
 
-        donnees[uid] = max(int(donnees.get(uid, 0)), xp)  # ne jamais faire baisser l'XP existant
+        donnees[uid] = max(int(donnees.get(uid, 0)), xp)
         importes += 1
         if guild.get_member(int(uid)) is None:
             absents += 1
 
     if importes == 0:
-        await interaction.followup.send(
-            f"No valid entries found in `{FICHIER_IMPORT}` (expected `id` and `xp`).",
-            ephemeral=True,
-        )
+        await interaction.followup.send("No valid entries were found in the stored import.", ephemeral=True)
         return
+
 
     _niveaux_modifies = True
     sauver_niveaux()
-
-
     presents = importes - absents
-    texte = (
-        f"✅ **{importes}** levels imported (matched by Discord ID).\n"
-        f"**{presents}** of these members are on this server."
-    )
+    texte = f"✅ **{importes}** levels imported. **{presents}** members are on this server."
     if absents:
-        texte += (
-            f"\n{absents} are not on this server: their level is kept in case they "
-            f"join, but they won't show up in `/leaderboard`."
-        )
+        texte += f"\n{absents} imported users are not currently on this server."
     if invalides:
         texte += f"\n⚠️ **{invalides}** invalid entries skipped."
     await interaction.followup.send(texte, ephemeral=True)
