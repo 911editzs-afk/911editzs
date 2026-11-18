@@ -86,7 +86,7 @@ client = MonBot(
 )
 tree = client.tree
 
-CHANNEL_ID = 1566082912124928150  # salon réception
+CHANNEL_ID = 1420172051448201216  # salon réception mis à jour[cite: 2]
 DUREE_TIMEOUT = timedelta(hours=1)
 SPAM_MAX_MESSAGES = 5            # plus de 5 messages...
 SPAM_FENETRE = 5                 # ...en moins de 5 secondes
@@ -268,7 +268,7 @@ RAID_JOINS_MAX = 5              # 5+ joins...
 RAID_FENETRE = 10               # ...en moins de 10 secondes
 RAID_DUREE = timedelta(minutes=10)  # mode raid actif pendant 10 min
 RAID_MUTE_NOUVEAUX = timedelta(hours=1)
-RAID_ANNOUNCE_CHANNEL_ID = 1566083033176740041
+RAID_ANNOUNCE_CHANNEL_ID = 1425505497049727119  # salon annonce anti-raid mis à jour[cite: 2]
 
 # guild_id → deque de timestamps de join
 _raid_joins = defaultdict(deque)
@@ -1551,9 +1551,6 @@ async def setxp_cmd(
 @tree.command(name="importlevels", description="Import the levels exported from DraftBot")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@tree.command(name="importlevels", description="Import the levels exported from DraftBot")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def importlevels_cmd(interaction: discord.Interaction):
     global _niveaux_modifies
     if not interaction.user.guild_permissions.administrator:
@@ -1563,12 +1560,16 @@ async def importlevels_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
-    # Charge via storage (MongoDB sur Render, fichier local en dev)
+
+    # Charger l'export depuis storage (MongoDB sur Render, fichier local en dev).
     try:
         lignes = storage.charger(FICHIER_IMPORT, defaut=None)
     except Exception as e:
-        await interaction.followup.send(f"Couldn't read `{FICHIER_IMPORT}`: {e}", ephemeral=True)
+        await interaction.followup.send(
+            f"Couldn't read `{FICHIER_IMPORT}` from storage: {e}", ephemeral=True
+        )
         return
+
 
     if not lignes:
         await interaction.followup.send(
@@ -1577,20 +1578,52 @@ async def importlevels_cmd(interaction: discord.Interaction):
         )
         return
 
+
+    # L'export DraftBot attendu est une liste d'objets {id, xp}.
+    if not isinstance(lignes, list):
+        await interaction.followup.send(
+            f"Invalid format for `{FICHIER_IMPORT}`: expected a JSON list of entries containing `id` and `xp`.",
+            ephemeral=True,
+        )
+        return
+
+
     donnees = NIVEAUX.setdefault(str(guild.id), {})
     absents = 0
-    for l in lignes:
-        uid = str(l["id"])
-        donnees[uid] = max(donnees.get(uid, 0), int(l["xp"]))  # on ne fait jamais baisser un niveau
+    importes = 0
+    invalides = 0
+    for ligne in lignes:
+        if not isinstance(ligne, dict) or "id" not in ligne or "xp" not in ligne:
+            invalides += 1
+            continue
+        try:
+            uid = str(int(ligne["id"]))
+            xp = int(ligne["xp"])
+            if xp < 0:
+                raise ValueError("XP cannot be negative")
+        except (TypeError, ValueError, OverflowError):
+            invalides += 1
+            continue
+
+        donnees[uid] = max(int(donnees.get(uid, 0)), xp)  # ne jamais faire baisser l'XP existant
+        importes += 1
         if guild.get_member(int(uid)) is None:
             absents += 1
+
+    if importes == 0:
+        await interaction.followup.send(
+            f"No valid entries found in `{FICHIER_IMPORT}` (expected `id` and `xp`).",
+            ephemeral=True,
+        )
+        return
 
     _niveaux_modifies = True
     sauver_niveaux()
 
-    presents = len(lignes) - absents
+
+    presents = importes - absents
     texte = (
-        f"✅ **{len(lignes)}** levels imported (matched by Discord ID).\n"
+        f"✅ **{importes}** levels imported (matched by Discord ID).\n"
         f"**{presents}** of these members are on this server."
     )
     if absents:
@@ -1598,7 +1631,11 @@ async def importlevels_cmd(interaction: discord.Interaction):
             f"\n{absents} are not on this server: their level is kept in case they "
             f"join, but they won't show up in `/leaderboard`."
         )
+    if invalides:
+        texte += f"\n⚠️ **{invalides}** invalid entries skipped."
     await interaction.followup.send(texte, ephemeral=True)
+
+
 # ---------- FILTRE ----------
 @client.event
 async def on_message(message):
@@ -2833,8 +2870,8 @@ async def dsstatgraph(interaction: discord.Interaction, graph: str = "flux", day
 
 # ---------- TICKETS ----------
 FICHIER_TICKETS = "tickets_config.json"
-TICKET_CATEGORY_ID = 1566084802082373763
-TRANSCRIPT_CHANNEL_ID = 1566084916016324658
+TICKET_CATEGORY_ID = 1492234570093826209  # catégorie des tickets mise à jour[cite: 2]
+TRANSCRIPT_CHANNEL_ID = 1565108521941336104  # salon de transcript mis à jour[cite: 2]
 
 
 def charger_tickets():
@@ -2907,8 +2944,8 @@ class TicketModal(discord.ui.Modal, title="Open a ticket"):
                 embed_links=True,
             ),
         }
-        # Leader + Staff peuvent voir et répondre
-        for role_id in (1566082434607616042, 1566082408032239666):
+        # Leader + Staff peuvent voir et répondre (IDs mis à jour)[cite: 2]
+        for role_id in (1397320661243793480, 1410411003291631707):
             role = guild.get_role(role_id)
             if role is not None:
                 overwrites[role] = discord.PermissionOverwrite(
@@ -2960,7 +2997,7 @@ class TicketModal(discord.ui.Modal, title="Open a ticket"):
         await ticket_channel.send(
             content=(
                 f"{user.mention} Welcome! A staff member will be with you shortly.\n"
-                f"<@&1566082434607616042> <@&1566082408032239666>"
+                f"<@&1397320661243793480> <@&1410411003291631707>"
             ),
             embed=embed,
             view=view,
