@@ -3123,9 +3123,14 @@ async def dl_context_menu(interaction: discord.Interaction, message: discord.Mes
 # Léger en RAM : on n'utilise PAS de modèle local.
 # 1) extrait ~12 s d'audio compressé (ffmpeg)  2) envoie à Shazam via shazamio
 # Prérequis : pip install shazamio   (+ ffmpeg sur la machine si possible)
-MUSIC_MAX_OCTETS = 8 * 1024 * 1024   # 8 Mo max (pièce jointe)
+MUSIC_MAX_OCTETS = 200 * 1024 * 1024  # 200 Mo max (le fichier est téléchargé sur le disque, pas en RAM)
+MUSIC_SANS_FFMPEG_OCTETS = 8 * 1024 * 1024  # sans ffmpeg, on ne peut traiter que les petits fichiers
 MUSIC_SAMPLE_SEC = 12                # seules les 12 premières secondes sont analysées
 MUSIC_TIMEOUT_SEC = 45
+
+# File d'attente (illimitée) : un seul morceau analysé à la fois, les autres attendent leur tour (ordre d'arrivée)
+MUSIC_VERROU = asyncio.Lock()
+MUSIC_ATTENTE = []                   # tickets : le premier est en cours, les suivants attendent
 
 
 async def _music_extraire_echantillon(src: str, dest: str) -> tuple[bool, str]:
@@ -3135,7 +3140,13 @@ async def _music_extraire_echantillon(src: str, dest: str) -> tuple[bool, str]:
         import shutil
         import subprocess
         ffmpeg = shutil.which("ffmpeg")
+        petit = os.path.getsize(src) <= MUSIC_SANS_FFMPEG_OCTETS
         if not ffmpeg:
+            if not petit:
+                return False, (
+                    "ffmpeg is not installed on the server, so only files up to "
+                    f"{MUSIC_SANS_FFMPEG_OCTETS // (1024 * 1024)} MB can be processed."
+                )
             # Pas de ffmpeg : on utilise le fichier tel quel (moins optimal mais fonctionnel)
             shutil.copy2(src, dest)
             return True, ""
@@ -3151,12 +3162,16 @@ async def _music_extraire_echantillon(src: str, dest: str) -> tuple[bool, str]:
                 "-b:a", "64k",
                 dest,
             ]
-            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            proc = subprocess.run(cmd, capture_output=True, timeout=120)
             if proc.returncode != 0 or not os.path.exists(dest) or os.path.getsize(dest) == 0:
-                # Fallback : fichier original
+                if not petit:
+                    return False, "ffmpeg could not read any audio from this file."
+                # Fallback : fichier original (petits fichiers seulement)
                 shutil.copy2(src, dest)
             return True, ""
         except Exception as e:
+            if not petit:
+                return False, str(e)[:200]
             try:
                 shutil.copy2(src, dest)
                 return True, ""
@@ -3293,22 +3308,34 @@ def _songfinder_embed(info: dict, requester_name: str) -> discord.Embed:
     return embed
 
 
-async def _songfinder_depuis_attachment(attachment: discord.Attachment, dossier_id, requester_name: str):
+async def _music_telecharger(attachment: discord.Attachment, dest: str):
+    """Télécharge la pièce jointe par morceaux de 1 Mo directement sur le disque (RAM quasi nulle)."""
+    timeout = aiohttp.ClientTimeout(total=600, sock_connect=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(attachment.url) as rep_http:
+            if rep_http.status != 200:
+                raise RuntimeError(f"download failed (HTTP {rep_http.status})")
+            total = 0
+            with open(dest, "wb") as f:
+                async for morceau in rep_http.content.iter_chunked(1024 * 1024):
+                    total += len(morceau)
+                    if total > MUSIC_MAX_OCTETS:
+                        raise RuntimeError(
+                            f"file larger than {MUSIC_MAX_OCTETS // (1024 * 1024)} MB"
+                        )
+                    f.write(morceau)
+
+
+async def _songfinder_traiter(attachment: discord.Attachment, dossier_id, requester_name: str):
     """Télécharge la pièce jointe, reconnaît le morceau, retourne (embed|None, erreur|None)."""
     nom = (attachment.filename or "audio").lower()
-    if attachment.size and attachment.size > MUSIC_MAX_OCTETS:
-        return None, (
-            f"❌ File too large (**{attachment.size // (1024 * 1024)} MB**). "
-            f"Maximum is **{MUSIC_MAX_OCTETS // (1024 * 1024)} MB** "
-            f"(send a short clip of the song)."
-        )
 
     dossier = os.path.join("/tmp", f"music_{dossier_id}")
     src = os.path.join(dossier, "input" + (os.path.splitext(nom)[1] or ".bin"))
     sample = os.path.join(dossier, "sample.mp3")
     try:
         os.makedirs(dossier, exist_ok=True)
-        await attachment.save(src)
+        await _music_telecharger(attachment, src)
 
         ok, err = await _music_extraire_echantillon(src, sample)
         if not ok:
@@ -3343,12 +3370,55 @@ async def _songfinder_depuis_attachment(attachment: discord.Attachment, dossier_
             pass
 
 
+def _music_notifier(maj_statut, texte):
+    """Met à jour le message de statut sans bloquer (et sans jamais faire planter la file)."""
+    if maj_statut is None:
+        return
+
+    async def _run():
+        try:
+            await maj_statut(texte)
+        except Exception:
+            pass
+
+    asyncio.create_task(_run())
+
+
+async def _songfinder_depuis_attachment(attachment: discord.Attachment, dossier_id, requester_name: str, maj_statut=None):
+    """Met la demande en file d'attente : UN SEUL son analysé à la fois, dans l'ordre d'arrivée.
+    maj_statut(texte) est appelé (async) pour informer la personne de sa position.
+    Retourne (embed|None, erreur|None)."""
+    if attachment.size and attachment.size > MUSIC_MAX_OCTETS:
+        return None, (
+            f"❌ File too large (**{attachment.size // (1024 * 1024)} MB**). "
+            f"Maximum is **{MUSIC_MAX_OCTETS // (1024 * 1024)} MB**."
+        )
+    ticket = {"maj": maj_statut}
+    MUSIC_ATTENTE.append(ticket)   # pas d'await entre l'ajout et le verrou : l'ordre est respecté
+    try:
+        position = MUSIC_ATTENTE.index(ticket)
+        if position > 0:
+            _music_notifier(
+                maj_statut,
+                f"⏳ Another song is being analyzed. You are **#{position}** in the queue...",
+            )
+        async with MUSIC_VERROU:
+            _music_notifier(maj_statut, "🔍 Searching for the track...")
+            return await _songfinder_traiter(attachment, dossier_id, requester_name)
+    finally:
+        MUSIC_ATTENTE.remove(ticket)
+        # ceux qui attendent encore (hors le prochain, qui démarre) voient leur position avancer
+        for i, t in enumerate(MUSIC_ATTENTE):
+            if i >= 1:
+                _music_notifier(t["maj"], f"⏳ You are **#{i}** in the queue...")
+
+
 @tree.command(
     name="songfinder",
     description="Recognize a song from an audio/video file (Shazam, low RAM)",
 )
 @app_commands.guild_only()
-@app_commands.describe(fichier="Audio or video file containing the song (max 8 MB)")
+@app_commands.describe(fichier="Audio or video file containing the song (max 200 MB)")
 async def songfinder_cmd(interaction: discord.Interaction, fichier: discord.Attachment):
     """Recognize a song from a file. Designed to stay light on RAM on Render."""
     if not _attachment_audio_video(fichier):
@@ -3360,13 +3430,17 @@ async def songfinder_cmd(interaction: discord.Interaction, fichier: discord.Atta
         return
 
     await interaction.response.defer()
+
+    async def maj(texte):
+        await interaction.edit_original_response(content=texte)
+
     embed, err = await _songfinder_depuis_attachment(
-        fichier, interaction.id, interaction.user.display_name
+        fichier, interaction.id, interaction.user.display_name, maj
     )
     if err:
-        await interaction.followup.send(err)
+        await interaction.edit_original_response(content=err, embed=None)
         return
-    await interaction.followup.send(embed=embed)
+    await interaction.edit_original_response(content=None, embed=embed)
 
 
 async def traiter_songfinder_message(message: discord.Message):
@@ -3404,8 +3478,12 @@ async def traiter_songfinder_message(message: discord.Message):
         return
 
     statut = await message.reply("🔍 Searching for the track...", mention_author=False)
+
+    async def maj(texte):
+        await statut.edit(content=texte)
+
     embed, err = await _songfinder_depuis_attachment(
-        attachment, message.id, message.author.display_name
+        attachment, message.id, message.author.display_name, maj
     )
     try:
         if err:
