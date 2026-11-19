@@ -5,3 +5,4 @@ dnspython>=2.4
 matplotlib>=3.8
 tzdata
 audioop-lts; python_version >= "3.13"
+shazamio
