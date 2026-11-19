@@ -81,6 +81,7 @@ class MonBot(discord.Client):
         sauvegarde_niveaux.start()  # sauvegarde les niveaux sur le disque
         boucle_dsstat.start()       # rapport quotidien du serveur
         verif_tiktok.start()        # alertes de paliers d'abonnés TikTok
+        verif_videos.start()        # annonces de nouvelles vidéos (RSSHub, toutes les 5 min)
         boucle_snapshots_antinuke.start()  # snapshots anti-nuke
         await demarrer_serveur_web()  # utile seulement sur Render (Web Service)
         await telecharger_mots()      # liste de mots interdits depuis GitHub (si MOTS_URL est défini)
@@ -1320,6 +1321,380 @@ async def tiktokcheck(interaction: discord.Interaction):
     await interaction.followup.send(
         "\n".join(lignes), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
     )
+
+
+# ---------- ANNONCES DE NOUVELLES VIDÉOS (flux RSS / RSSHub) ----------
+# Commandes : /follow (ajouter un lien RSS + salon d'annonce) et /stopfollow (arrêter).
+# Toutes les 5 minutes le bot lit chaque flux suivi. Si une vidéo qu'il n'a jamais vue apparaît,
+# il l'annonce avec son lien dans le salon choisi.
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, unquote
+
+VIDEO_INTERVALLE_MIN = 5
+VIDEO_MAX_ANNONCES = 3                  # max de vidéos annoncées d'un coup pour un flux (anti-flood)
+VIDEO_AGE_MAX = timedelta(days=2)       # une vidéo "nouvelle" mais publiée il y a plus de 2 jours n'est pas annoncée
+VIDEO_VUS_MAX = 200                     # nombre d'identifiants de vidéos mémorisés par flux
+FICHIER_VIDEO_COMPTES = "video_comptes.json"   # flux suivis (MongoDB / fichier)
+FICHIER_VIDEO_VUS = "video_vus.json"           # vidéos déjà vues / annoncées
+MESSAGE_VIDEO_DEFAUT = "Yoo @everyone {user} just posted a new video!\n{link}"
+VIDEO_VERROU = asyncio.Lock()
+
+
+def _date_flux(texte):
+    """Lit une date RSS (RFC 822) ou Atom (ISO 8601). Retourne un datetime UTC ou None."""
+    if not texte:
+        return None
+    texte = texte.strip()
+    d = None
+    try:
+        d = parsedate_to_datetime(texte)
+    except (TypeError, ValueError):
+        try:
+            d = datetime.fromisoformat(texte.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if d is None:
+        return None
+    if d.tzinfo is None:
+        from datetime import timezone
+        d = d.replace(tzinfo=timezone.utc)
+    return d
+
+
+def parser_flux_videos(brut) -> list:
+    """Lit un flux RSS 2.0 ou Atom. Retourne [{id, link, title, date}, ...] dans l'ordre du flux."""
+    racine = ET.fromstring(brut)
+    if racine.tag.split("}")[-1].lower() not in ("rss", "feed", "rdf"):
+        raise ET.ParseError("not an RSS/Atom feed")
+    videos = []
+    for el in racine.iter():
+        if not isinstance(el.tag, str) or el.tag.split("}")[-1] not in ("item", "entry"):
+            continue
+        lien = titre = ident = date_txt = None
+        for enfant in el:
+            if not isinstance(enfant.tag, str):
+                continue
+            nom = enfant.tag.split("}")[-1]
+            texte = (enfant.text or "").strip()
+            if nom == "link":
+                href = enfant.get("href")
+                if href:
+                    if lien is None or enfant.get("rel") in (None, "alternate"):
+                        lien = href.strip()
+                elif texte and lien is None:
+                    lien = texte
+            elif nom == "title":
+                titre = texte
+            elif nom in ("guid", "id"):
+                ident = texte
+            elif nom in ("pubDate", "published", "updated") and date_txt is None:
+                date_txt = texte
+        if not lien:
+            continue
+        videos.append({"id": ident or lien, "link": lien, "title": titre or "", "date": _date_flux(date_txt)})
+    return videos
+
+
+def videos_a_annoncer(videos: list, vus, maintenant):
+    """Compare le flux aux vidéos déjà vues. Retourne (a_annoncer, a_ignorer), du plus ancien au plus récent.
+    a_ignorer = nouvelles pour le bot mais trop vieilles ou en trop grand nombre : marquées vues sans annonce."""
+    vus = set(vus)
+    nouveaux = [v for v in videos if v["id"] not in vus]
+    if all(v["date"] for v in nouveaux):
+        nouveaux.sort(key=lambda v: v["date"])
+    else:
+        nouveaux.reverse()  # les flux listent la plus récente en premier
+    a_annoncer, a_ignorer = [], []
+    for v in nouveaux:
+        if v["date"] and maintenant - v["date"] > VIDEO_AGE_MAX:
+            a_ignorer.append(v)
+        else:
+            a_annoncer.append(v)
+    if len(a_annoncer) > VIDEO_MAX_ANNONCES:
+        a_ignorer += a_annoncer[:-VIDEO_MAX_ANNONCES]
+        a_annoncer = a_annoncer[-VIDEO_MAX_ANNONCES:]
+    return a_annoncer, a_ignorer
+
+
+def texte_video(compte: dict, video: dict) -> str:
+    modele = compte.get("message") or MESSAGE_VIDEO_DEFAUT
+    titre = discord.utils.escape_mentions(video.get("title") or "")[:150]
+    texte = (
+        modele.replace("{user}", f"**{compte.get('name') or 'Someone'}**")
+        .replace("{title}", titre)
+        .replace("{link}", video["link"])
+    )
+    if video["link"] not in texte:
+        texte += "\n" + video["link"]   # le lien est toujours présent
+    return texte[:2000]
+
+
+def cle_video(guild_id: int, url: str) -> str:
+    """Clé courte et sûre (pas de point ni de slash : compatible MongoDB)."""
+    return f"{guild_id}_{hashlib.sha1(url.strip().encode('utf-8')).hexdigest()[:12]}"
+
+
+def nom_depuis_url(url: str) -> str:
+    """Devine un nom d'affichage depuis le lien (ex: .../tiktok/user/@pseudo -> pseudo)."""
+    p = urlparse(url)
+    chemin = unquote(p.path)
+    m = re.search(r"@([\w.\-]+)", chemin)
+    if m:
+        return m.group(1)
+    morceaux = [s for s in chemin.split("/") if s]
+    if morceaux:
+        return morceaux[-1][:50]
+    return (p.hostname or "feed")[:50]
+# (fin des fonctions pures)
+
+
+async def recuperer_flux_videos(session: aiohttp.ClientSession, url: str) -> list:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DiscordBot)", "Accept": "application/rss+xml, application/xml, */*"}
+    async with session.get(url, headers=headers) as r:
+        if r.status != 200:
+            raise RuntimeError(f"the server answered HTTP {r.status}")
+        brut = await r.read()
+    if len(brut) > 5 * 1024 * 1024:
+        raise RuntimeError("feed too large")
+    try:
+        return parser_flux_videos(brut)
+    except ET.ParseError as e:
+        raise RuntimeError(f"this link is not a valid RSS feed ({e})")
+
+
+def charger_comptes_video() -> dict:
+    try:
+        data = storage.charger(FICHIER_VIDEO_COMPTES)
+    except Exception as e:
+        print(f"[VIDEO] Lecture des flux impossible : {e}")
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
+        return data["accounts"]
+    return {}
+
+
+def charger_vus_video() -> dict:
+    try:
+        data = storage.charger(FICHIER_VIDEO_VUS)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _envoyer_video(compte: dict, video: dict) -> bool:
+    canal = client.get_channel(compte["channel_id"])
+    if canal is None:
+        try:
+            canal = await client.fetch_channel(compte["channel_id"])
+        except Exception as e:
+            print(f"[VIDEO] Salon introuvable ({compte['channel_id']}) : {e}")
+            return False
+    try:
+        await canal.send(
+            texte_video(compte, video),
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True),
+        )
+        return True
+    except discord.Forbidden:
+        print(f"[VIDEO] Pas la permission d'écrire dans #{getattr(canal, 'name', '?')}.")
+    except discord.HTTPException as e:
+        print(f"[VIDEO] Erreur d'envoi : {e}")
+    return False
+
+
+@tasks.loop(minutes=VIDEO_INTERVALLE_MIN)
+async def verif_videos():
+    try:
+        async with VIDEO_VERROU:
+            comptes = charger_comptes_video()
+            if not comptes:
+                return
+            vus_tous = charger_vus_video()
+            modifie = False
+            timeout = aiohttp.ClientTimeout(total=25)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for cle, compte in comptes.items():
+                    try:
+                        videos = await recuperer_flux_videos(session, compte["url"])
+                    except Exception as e:
+                        print(f"[VIDEO] {compte.get('name')} : lecture impossible ({e})")
+                        continue
+                    if not videos:
+                        continue
+
+                    vus = vus_tous.get(cle)
+                    if vus is None:
+                        # Première observation : on mémorise tout sans rien annoncer
+                        vus_tous[cle] = [v["id"] for v in videos][:VIDEO_VUS_MAX]
+                        modifie = True
+                        print(f"[VIDEO] {compte['name']} : {len(videos)} vidéo(s) mémorisée(s), pas d'annonce.")
+                        continue
+
+                    a_annoncer, a_ignorer = videos_a_annoncer(videos, vus, discord.utils.utcnow())
+                    nouveaux_ids = [v["id"] for v in a_ignorer]
+                    for v in a_annoncer:
+                        if await _envoyer_video(compte, v):
+                            nouveaux_ids.append(v["id"])
+                            print(f"[VIDEO] Annonce envoyée pour {compte['name']} : {v['link']}")
+                    if nouveaux_ids:
+                        vus_tous[cle] = (vus + nouveaux_ids)[-VIDEO_VUS_MAX:]
+                        modifie = True
+                    await asyncio.sleep(1)
+            if modifie:
+                storage.sauver(FICHIER_VIDEO_VUS, vus_tous)
+    except Exception as e:  # la boucle ne doit jamais s'arrêter
+        import traceback
+        print(f"[VIDEO] Erreur dans la vérification : {e!r}")
+        traceback.print_exc()
+
+
+@verif_videos.before_loop
+async def _avant_verif_videos():
+    await client.wait_until_ready()
+
+
+@tree.command(name="follow", description="Announce the new videos of an RSS feed in a channel (checked every 5 minutes)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    rss_link="The RSS link of the account (e.g. your RSSHub link)",
+    channel="Channel where the announcement is sent",
+    message="Announcement text. Use {user}, {title} and {link}. Optional.",
+    name="Name shown in the announcement (default: guessed from the link). Optional.",
+)
+async def follow_cmd(
+    interaction: discord.Interaction,
+    rss_link: str,
+    channel: discord.TextChannel,
+    message: Optional[app_commands.Range[str, 1, 1500]] = None,
+    name: Optional[app_commands.Range[str, 1, 50]] = None,
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    url = rss_link.strip().strip("<>")
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        await interaction.response.send_message(
+            "❌ Invalid link. It must start with `http://` or `https://`.", ephemeral=True
+        )
+        return
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            f"❌ I can't send messages in {channel.mention}. Give me **View Channel** and **Send Messages** there.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # On vérifie que le lien est bien un flux lisible avant de l'enregistrer
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+            videos = await recuperer_flux_videos(session, url)
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ I couldn't read this feed: `{str(e)[:300]}`\nCheck the link and try again. Nothing was saved.",
+            ephemeral=True,
+        )
+        return
+
+    cle = cle_video(interaction.guild.id, url)
+    async with VIDEO_VERROU:
+        comptes = charger_comptes_video()
+        ancien = comptes.get(cle, {})
+        compte = {
+            "guild_id": interaction.guild.id,
+            "url": url,
+            "name": name or ancien.get("name") or nom_depuis_url(url),
+            "channel_id": channel.id,
+            "message": message if message is not None else ancien.get("message"),
+        }
+        comptes[cle] = compte
+        try:
+            storage.sauver(FICHIER_VIDEO_COMPTES, {"accounts": comptes})
+            vus = charger_vus_video()
+            if cle not in vus and videos:
+                # les vidéos déjà en ligne sont mémorisées : seules les prochaines seront annoncées
+                vus[cle] = [v["id"] for v in videos][:VIDEO_VUS_MAX]
+                storage.sauver(FICHIER_VIDEO_VUS, vus)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Storage error: {e}", ephemeral=True)
+            return
+
+    if videos:
+        etat = f"Feed OK: {len(videos)} existing video(s) noted (they won't be announced). Latest: <{videos[0]['link']}>"
+    else:
+        etat = "The feed works but is empty. The first video posted will be announced."
+    apercu = texte_video(compte, {"link": "https://example.com/video", "title": "Video title"})
+    await interaction.followup.send(
+        f"✅ Now following **{compte['name']}** → {channel.mention} (checked every {VIDEO_INTERVALLE_MIN} min)\n"
+        f"{etat}\nPreview of the announcement:\n>>> {apercu}"[:1990],
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="stopfollow", description="Stop following an RSS feed")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(feed="The feed to stop following (pick it in the list, or paste its link / name)")
+async def stopfollow_cmd(interaction: discord.Interaction, feed: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    async with VIDEO_VERROU:
+        comptes = charger_comptes_video()
+        ici = {k: c for k, c in comptes.items() if c.get("guild_id") == interaction.guild.id}
+        texte = feed.strip().strip("<>")
+        cle = None
+        if texte in ici:
+            cle = texte
+        else:
+            trouves = [k for k, c in ici.items() if c.get("url") == texte]
+            if not trouves:
+                trouves = [k for k, c in ici.items() if (c.get("name") or "").lower() == texte.lower()]
+            if len(trouves) == 1:
+                cle = trouves[0]
+            elif len(trouves) > 1:
+                await interaction.response.send_message(
+                    "Several feeds have this name. Please pick one from the list or paste its link.",
+                    ephemeral=True,
+                )
+                return
+        if cle is None:
+            await interaction.response.send_message(
+                "❌ This feed is not followed. Pick one from the list that appears when you type.", ephemeral=True
+            )
+            return
+        nom = ici[cle].get("name")
+        comptes.pop(cle)
+        try:
+            storage.sauver(FICHIER_VIDEO_COMPTES, {"accounts": comptes})
+            vus = charger_vus_video()
+            if vus.pop(cle, None) is not None:
+                storage.sauver(FICHIER_VIDEO_VUS, vus)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Storage error: {e}", ephemeral=True)
+            return
+    await interaction.response.send_message(
+        f"✅ No longer following **{nom}**.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@stopfollow_cmd.autocomplete("feed")
+async def stopfollow_autocomplete(interaction: discord.Interaction, current: str):
+    saisie = current.lower()
+    choix = []
+    for cle, c in charger_comptes_video().items():
+        if c.get("guild_id") != interaction.guild_id:
+            continue
+        libelle = f"{c.get('name')} — {c.get('url')}"[:100]
+        if saisie in libelle.lower():
+            choix.append(app_commands.Choice(name=libelle, value=cle))
+    return choix[:25]
 
 
 @client.event
@@ -6626,6 +7001,14 @@ async def adminhelp_cmd(interaction: discord.Interaction):
         value=(
             "`/tiktokadd` `/tiktokremove` `/tiktokcheck` — Follower milestone alerts\n"
             "`/setupvoc` — Private voice system"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📹 Video announcements",
+        value=(
+            "`/follow rss_link: channel:` — Announce the new videos of an RSS feed (RSSHub...) in a channel, checked every 5 min\n"
+            "`/stopfollow feed:` — Stop following a feed"
         ),
         inline=False,
     )
