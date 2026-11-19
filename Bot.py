@@ -38,16 +38,24 @@ import storage  # noqa: E402  (MongoDB sur Render, fichiers .json en local)
 STATUT = ".gg/paek"
 
 
+_web_demarre = False
+etat_connexion = "connexion en cours..."   # affiché sur la page de statut
+
+
 async def demarrer_serveur_web():
     """Mini serveur web : Render (offre Web Service) exige un port ouvert, et un site de ping
     (UptimeRobot...) peut l'appeler pour empêcher le bot de s'endormir. Inactif sans variable PORT."""
+    global _web_demarre
     port = os.getenv("PORT")
-    if not port:
+    if not port or _web_demarre:
         return
+    _web_demarre = True
     from aiohttp import web
 
     async def ok(_request):
-        return web.Response(text="Bot en ligne ✅")
+        if client.is_ready():
+            return web.Response(text=f"Bot connecté à Discord ✅ ({len(client.guilds)} serveur(s))")
+        return web.Response(text=f"Bot NON connecté à Discord ⏳\nÉtat : {etat_connexion}")
 
     app = web.Application()
     app.router.add_get("/", ok)
@@ -72,7 +80,11 @@ class MonBot(discord.Client):
         verif_raid.start()          # expire le mode anti-raid
         sauvegarde_niveaux.start()  # sauvegarde les niveaux sur le disque
         boucle_dsstat.start()       # rapport quotidien du serveur
+        verif_tiktok.start()        # alertes de paliers d'abonnés TikTok
+        boucle_snapshots_antinuke.start()  # snapshots anti-nuke
         await demarrer_serveur_web()  # utile seulement sur Render (Web Service)
+        await telecharger_mots()      # liste de mots interdits depuis GitHub (si MOTS_URL est défini)
+        recharger_mots()              # fusionne liste de base + fichier + GitHub + MongoDB
         # Vues persistantes tickets (survivent au redémarrage)
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
@@ -86,13 +98,49 @@ client = MonBot(
 )
 tree = client.tree
 
+
+@tree.error
+async def erreur_commande(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Toute erreur de commande est écrite dans les logs ET affichée à l'utilisateur
+    (au lieu de 'L'application ne répond pas')."""
+    import traceback
+    nom = getattr(interaction.command, "name", None) or (interaction.data or {}).get("name", "?")
+    print(f"[COMMANDE] Erreur sur /{nom} : {error!r}")
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    # Commande inconnue en mémoire : on la réenregistre localement (aucune requête à Discord)
+    if isinstance(error, app_commands.CommandNotFound) and interaction.guild and COMMANDES:
+        for c in COMMANDES:
+            tree.add_command(c, guild=interaction.guild, override=True)
+
+    cause = getattr(error, "original", error)
+    message = f"❌ Error in `/{nom}`: `{type(cause).__name__}: {cause}`"[:1900]
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as e:
+        print(f"[COMMANDE] Impossible d'envoyer le message d'erreur : {e}")
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    nom = (interaction.data or {}).get("name") or (interaction.data or {}).get("custom_id", "?")
+    print(f"[INTERACTION] {interaction.type.name} « {nom} » de {interaction.user} sur {getattr(interaction.guild, 'name', 'DM')}")
+
 CHANNEL_ID = 1420172051448201216  # salon réception mis à jour[cite: 2]
 DUREE_TIMEOUT = timedelta(hours=1)
 SPAM_MAX_MESSAGES = 5            # plus de 5 messages...
 SPAM_FENETRE = 5                 # ...en moins de 5 secondes
 DUREE_TIMEOUT_SPAM = timedelta(hours=1)
 SPAM_ANALYSE = 30                # le bot relit les 30 dernières secondes pour tout effacer
+TEXTWALL_MAX_CARACTERES = 1500   # un message plus long que ça = mur de texte
+TEXTWALL_MAX_LIGNES = 15         # ...ou plus de 15 lignes
 FICHIER_MOTS = "mots_interdits.txt"  # liste LDNOOBW fusionnée (un mot par ligne)
+# Lien "raw" du fichier sur GitHub (ex: https://raw.githubusercontent.com/TON_PSEUDO/TON_REPO/main/mots_interdits.txt)
+# À mettre dans les variables d'environnement (Render) sous le nom MOTS_URL. Optionnel.
+URL_MOTS = os.getenv("MOTS_URL", "").strip()
 
 # Mots en plus du fichier (insultes courantes FR/EN que tu veux garantir)
 MOTS_SUPPLEMENTAIRES = [
@@ -119,13 +167,32 @@ def normaliser(texte):
     return texte.translate(LEET)
 
 
-def charger_mots():
+def trouver_fichier_mots():
+    """Cherche mots_interdits.txt à côté de Bot.py puis dans le dossier courant,
+    sans tenir compte des majuscules (Linux/Render est sensible à la casse)."""
+    dossiers = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+    for dossier in dossiers:
+        try:
+            for nom in os.listdir(dossier):
+                if nom.lower() == FICHIER_MOTS.lower():
+                    return os.path.join(dossier, nom)
+        except OSError:
+            pass
+    return None
+
+
+def charger_mots(extra=None):
     mots = list(MOTS_SUPPLEMENTAIRES)
-    if os.path.exists(FICHIER_MOTS):
-        with open(FICHIER_MOTS, "r", encoding="utf-8") as f:
-            mots += [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    chemin = trouver_fichier_mots()
+    if chemin:
+        with open(chemin, "r", encoding="utf-8") as f:
+            lus = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        mots += lus
+        print(f"[MOTS] {len(lus)} mots lus dans {chemin}")
     else:
         print(f"[ATTENTION] {FICHIER_MOTS} introuvable : seule la liste de base est utilisée.")
+    if extra:
+        mots += extra
     return mots
 
 
@@ -141,13 +208,181 @@ def construire_motif(mot):
 
 MOTIFS = []          # (motif_regex, mot_normalise)
 MOTS_NORM = []       # liste des mots normalisés (pour substring dans le spam)
-_vus = set()
-for _m in charger_mots():
-    _n = normaliser(_m).strip()
-    if _n and _n not in _vus and _n not in MOTS_AUTORISES:
-        _vus.add(_n)
-        MOTIFS.append((construire_motif(_m), _n))
-        MOTS_NORM.append(_n)
+
+
+def appliquer_mots(mots):
+    """(Re)construit les listes de détection en place."""
+    vus = set()
+    motifs, norms = [], []
+    for m in mots:
+        n = normaliser(m).strip()
+        if n and n not in vus and n not in MOTS_AUTORISES:
+            vus.add(n)
+            motifs.append((construire_motif(m), n))
+            norms.append(n)
+    MOTIFS[:] = motifs
+    MOTS_NORM[:] = norms
+
+
+appliquer_mots(charger_mots())
+
+
+FICHIER_MOTS_DB = "mots_interdits_db.json"  # stocké via storage (MongoDB sur Render)
+_mots_github = []  # mots téléchargés depuis MOTS_URL (si défini)
+
+
+def charger_mots_db():
+    """Mots ajoutés via /importmots et /addmot (stockés dans MongoDB)."""
+    try:
+        data = storage.charger(FICHIER_MOTS_DB)
+    except Exception as e:
+        print(f"[ATTENTION] Lecture des mots MongoDB impossible : {e}")
+        return []
+    if isinstance(data, dict):
+        data = data.get("mots", [])
+    if not isinstance(data, list):
+        return []
+    return [str(m).strip() for m in data if str(m).strip()]
+
+
+def sauver_mots_db(mots):
+    storage.sauver(FICHIER_MOTS_DB, {"mots": mots})
+
+
+def recharger_mots():
+    """Reconstruit la détection : liste de base + fichier local + GitHub + MongoDB."""
+    base = _mots_github + charger_mots_db()
+    appliquer_mots(charger_mots(base))
+    print(f"[MOTS] {len(MOTIFS)} mots actifs au total ({len(base)} depuis GitHub/MongoDB).")
+
+
+async def telecharger_mots():
+    """Récupère la liste depuis GitHub (MOTS_URL) si défini."""
+    if not URL_MOTS:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(URL_MOTS, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    print(f"[ATTENTION] MOTS_URL a répondu {r.status} : liste GitHub non chargée.")
+                    return
+                texte = await r.text()
+    except Exception as e:
+        print(f"[ATTENTION] Impossible de télécharger MOTS_URL : {e}")
+        return
+    _mots_github[:] = [l.strip() for l in texte.splitlines() if l.strip() and not l.startswith("#")]
+    print(f"[MOTS] {len(_mots_github)} mots téléchargés depuis GitHub.")
+
+
+@tree.command(
+    name="importmots",
+    description="Import a banned words list (.txt, one word per line) into the bot storage",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(fichier="Text file with one banned word or phrase per line")
+async def importmots(interaction: discord.Interaction, fichier: discord.Attachment):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    if fichier.size > 5 * 1024 * 1024:
+        await interaction.response.send_message("File too large (5 MB max).", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        brut = await fichier.read()
+        texte = brut.decode("utf-8-sig")
+    except Exception as e:
+        await interaction.followup.send(f"Failed to read the file (UTF-8 text expected): {e}", ephemeral=True)
+        return
+
+    nouveaux = [l.strip() for l in texte.splitlines() if l.strip() and not l.startswith("#")]
+    if not nouveaux:
+        await interaction.followup.send("No words found in this file.", ephemeral=True)
+        return
+
+    existants = charger_mots_db()
+    connus = {normaliser(m).strip() for m in existants}
+    ajoutes = 0
+    for m in nouveaux:
+        n = normaliser(m).strip()
+        if n and n not in connus:
+            connus.add(n)
+            existants.append(m)
+            ajoutes += 1
+
+    try:
+        sauver_mots_db(existants)
+    except Exception as e:
+        await interaction.followup.send(f"Storage error: {e}", ephemeral=True)
+        return
+
+    recharger_mots()
+    await interaction.followup.send(
+        f"✅ **{ajoutes}** new words imported ({len(nouveaux) - ajoutes} already known).\n"
+        f"The filter now uses **{len(MOTIFS)}** words.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="addmot", description="Add a word or phrase to the banned words list")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(mot="The word or phrase to ban")
+async def addmot(interaction: discord.Interaction, mot: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    mot = mot.strip()
+    n = normaliser(mot).strip()
+    if not n:
+        await interaction.response.send_message("Invalid word.", ephemeral=True)
+        return
+
+    existants = charger_mots_db()
+    if any(normaliser(m).strip() == n for m in existants):
+        await interaction.response.send_message("This word is already in the list.", ephemeral=True)
+        return
+
+    existants.append(mot)
+    try:
+        sauver_mots_db(existants)
+    except Exception as e:
+        await interaction.response.send_message(f"Storage error: {e}", ephemeral=True)
+        return
+    recharger_mots()
+    await interaction.response.send_message(f"✅ `{mot}` added to the banned words.", ephemeral=True)
+
+
+@tree.command(name="removemot", description="Remove a word added with /addmot or /importmots")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(mot="The word or phrase to remove")
+async def removemot(interaction: discord.Interaction, mot: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    n = normaliser(mot).strip()
+    existants = charger_mots_db()
+    restants = [m for m in existants if normaliser(m).strip() != n]
+    if len(restants) == len(existants):
+        await interaction.response.send_message(
+            "This word is not in the stored list (words from the built-in list or the repo file can't be removed here).",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        sauver_mots_db(restants)
+    except Exception as e:
+        await interaction.response.send_message(f"Storage error: {e}", ephemeral=True)
+        return
+    recharger_mots()
+    await interaction.response.send_message(f"✅ `{mot}` removed.", ephemeral=True)
 
 
 # Les liens ne sont PAS analysés par le filtre de mots : leurs identifiants / signatures (chiffres et
@@ -220,13 +455,71 @@ COMMANDES = []  # commandes slash du bot, mémorisées au premier démarrage
 nettoyage_fait = False
 
 
+FICHIER_SYNC = "commandes_sync.json"   # mémorise ce qui a déjà été synchronisé (évite les 429 au redémarrage)
+_etat_sync = {}
+_hash_cmd = None
+
+
+def empreinte_commandes():
+    """Empreinte des commandes slash : si elle ne change pas, inutile de les renvoyer à Discord.
+    En cas de problème de calcul, on renvoie une valeur unique : le bot resynchronise (comportement sûr)."""
+    try:
+        return _calculer_empreinte()
+    except Exception as e:
+        print(f"[ATTENTION] Empreinte des commandes impossible ({e}) : synchronisation complète.")
+        return f"erreur-{time.time()}"
+
+
+def _calculer_empreinte():
+    items = []
+    for c in sorted(COMMANDES, key=lambda c: c.name):
+        params = []
+        for p in getattr(c, "parameters", []):
+            choix = [(ch.name, str(ch.value)) for ch in (getattr(p, "choices", None) or [])]
+            params.append((p.name, p.description, bool(p.required), str(getattr(p, "type", "")), choix))
+        items.append((c.name, c.description, str(getattr(c, "default_permissions", "")),
+                      bool(getattr(c, "guild_only", False)), params))
+    return hashlib.sha256(json.dumps(items, default=str, sort_keys=True).encode()).hexdigest()
+
+
+def lire_etat_sync():
+    try:
+        etat = storage.charger(FICHIER_SYNC)
+    except Exception:
+        return {}
+    return etat if isinstance(etat, dict) else {}
+
+
 async def synchroniser(guild):
-    """Enregistre les commandes slash uniquement sur ce serveur (pas de doublons)."""
+    """Enregistre les commandes slash uniquement sur ce serveur (pas de doublons).
+    Ne contacte Discord que si les commandes ont changé ou si le serveur est nouveau :
+    re-synchroniser à chaque démarrage / reconnexion provoque des erreurs 429."""
+    global _hash_cmd
     try:
         for c in COMMANDES:
             tree.add_command(c, guild=guild, override=True)
+
+        if _hash_cmd is None:
+            _hash_cmd = empreinte_commandes()
+        deja = (
+            os.getenv("FORCE_SYNC") != "1"
+            and _etat_sync.get("hash") == _hash_cmd
+            and guild.id in _etat_sync.get("guilds", [])
+        )
+        if deja:
+            print(f"[INFO] Commandes inchangées sur {guild.name} : synchronisation ignorée.")
+            return
+
         commandes = await tree.sync(guild=guild)
         print(f"[INFO] {len(commandes)} commande(s) slash enregistrée(s) sur {guild.name}")
+        _etat_sync["hash"] = _hash_cmd
+        _etat_sync.setdefault("guilds", [])
+        if guild.id not in _etat_sync["guilds"]:
+            _etat_sync["guilds"].append(guild.id)
+        try:
+            storage.sauver(FICHIER_SYNC, _etat_sync)
+        except Exception as e:
+            print(f"[ATTENTION] État de synchronisation non sauvegardé : {e}")
     except discord.Forbidden:
         print(
             f"[ERREUR] Accès refusé sur {guild.name} : réinvite le bot avec la case "
@@ -238,24 +531,44 @@ async def synchroniser(guild):
 
 @client.event
 async def on_ready():
-    global nettoyage_fait, honey_view_registered
+    global nettoyage_fait, honey_view_registered, regles_view_registered, _hash_cmd
     print(f"Connecté en tant que {client.user} | {len(MOTIFS)} mots interdits chargés")
     await client.change_presence(status=discord.Status.online, activity=discord.CustomActivity(name=STATUT))
     if not honey_view_registered:
         client.add_view(HoneypotCounterView())
         honey_view_registered = True
+    if not regles_view_registered:
+        client.add_view(RulesView())
+        regles_view_registered = True
     if not nettoyage_fait:
         nettoyage_fait = True
         COMMANDES.extend(tree.get_commands())
-        # Supprime les anciennes commandes globales (c'est elles qui créaient le doublon)
+        # Retire les commandes globales localement (elles créaient le doublon)
         tree.clear_commands(guild=None)
-        try:
-            await tree.sync()
-            print("[INFO] Anciennes commandes globales supprimées (anti-doublon)")
-        except Exception as e:
-            print(f"[ERREUR] Nettoyage des commandes globales impossible : {e}")
+        _hash_cmd = empreinte_commandes()
+        _etat_sync.update(lire_etat_sync())
+        if os.getenv("FORCE_SYNC") == "1" or _etat_sync.get("hash") != _hash_cmd:
+            # Les commandes ont changé (ou premier démarrage) : on repart de zéro, une seule fois.
+            _etat_sync.clear()
+            try:
+                await tree.sync()
+                print("[INFO] Anciennes commandes globales supprimées (anti-doublon)")
+            except Exception as e:
+                print(f"[ERREUR] Nettoyage des commandes globales impossible : {e}")
     for guild in client.guilds:
         await synchroniser(guild)
+    # Snapshots anti-nuke pour les serveurs déjà activés
+    for g in client.guilds:
+        if antinuke_actif(g.id):
+            try:
+                prendre_snapshot_guild(g)
+            except Exception as e:
+                print(f"[ANTINUKE] Snapshot initial échoué sur {g.name}: {e}")
+
+    print(f"[INFO] Prêt : {len(COMMANDES)} commande(s) en mémoire, {len(client.guilds)} serveur(s).")
+
+    # Vocaux privés : nettoie les salons vides orphelins et réassocie les salons actifs
+    await reconstruire_tous_vocaux()
 
 
 @client.event
@@ -443,6 +756,10 @@ async def on_member_join(member):
     now = time.time()
     dsstat_evenement(guild.id, "joins", member)  # rapport quotidien
 
+    # Rôle automatique à l'arrivée (retiré quand la personne clique sur "Accept rules")
+    if not member.bot:
+        await donner_role_arrivee(member)
+
     # Expire le mode raid si le timer est fini
     until = _raid_mode_until.get(guild.id)
     if until is not None and now >= until:
@@ -488,6 +805,523 @@ async def on_member_join(member):
     )
 
 
+# ---------- RÔLE À L'ARRIVÉE, /embed ET BOUTON "ACCEPT RULES" ----------
+ROLE_ARRIVEE_ID = 1420131845202509864   # donné automatiquement à l'arrivée
+ROLE_REGLES_ID = 1397316935103942696    # donné quand la personne clique sur "Accept rules"
+COULEUR_EMBED = discord.Color.from_rgb(155, 89, 182)  # violet
+
+regles_view_registered = False
+
+
+async def donner_role_arrivee(member: discord.Member):
+    role = member.guild.get_role(ROLE_ARRIVEE_ID)
+    if role is None:
+        print(f"[ARRIVÉE] Rôle {ROLE_ARRIVEE_ID} introuvable sur {member.guild.name}.")
+        return
+    try:
+        await member.add_roles(role, reason="Automatic role on join")
+    except discord.Forbidden:
+        print(
+            f"[ARRIVÉE] Impossible de donner le rôle à {member} : le rôle du bot doit être "
+            f"AU-DESSUS de « {role.name} » et avoir la permission Gérer les rôles."
+        )
+    except discord.HTTPException as e:
+        print(f"[ARRIVÉE] Erreur en donnant le rôle à {member} : {e}")
+
+
+class RulesView(discord.ui.View):
+    """Bouton vert persistant : retire le rôle d'arrivée et donne le rôle 'règles acceptées'."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Accept rules", style=discord.ButtonStyle.success, custom_id="accept_rules")
+    async def accept_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        member = interaction.user
+        guild = interaction.guild
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.followup.send("This only works inside the server.", ephemeral=True)
+            return
+
+        role_arrivee = guild.get_role(ROLE_ARRIVEE_ID)
+        role_regles = guild.get_role(ROLE_REGLES_ID)
+        if role_regles is None:
+            await interaction.followup.send("The rules role no longer exists. Tell an admin.", ephemeral=True)
+            return
+
+        if role_regles in member.roles and (role_arrivee is None or role_arrivee not in member.roles):
+            await interaction.followup.send("✅ You already accepted the rules.", ephemeral=True)
+            return
+
+        try:
+            if role_arrivee is not None and role_arrivee in member.roles:
+                await member.remove_roles(role_arrivee, reason="Accepted the rules")
+            if role_regles not in member.roles:
+                await member.add_roles(role_regles, reason="Accepted the rules")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I can't change your roles. An admin must put my role above these roles.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Discord error: {e}", ephemeral=True)
+            return
+
+        await interaction.followup.send("✅ Rules accepted, welcome!", ephemeral=True)
+
+
+def _url_ok(texte: str) -> bool:
+    return texte.startswith(("http://", "https://"))
+
+
+SEPARATEUR = "━" * 20
+
+
+def construire_embed(guild, titre, texte, footer=None, image=None, thumbnail=None):
+    """Embed violet 'soigné' : grand titre + séparateur, auteur (serveur), vignette, pied de page, date."""
+    description = f"# {titre}\n{SEPARATEUR}\n\n{texte}" if titre else texte
+    embed = discord.Embed(description=description, color=COULEUR_EMBED, timestamp=discord.utils.utcnow())
+    icone = guild.icon.url if guild and guild.icon else None
+    if guild:
+        embed.set_author(name=guild.name, icon_url=icone)
+    miniature = thumbnail or icone
+    if miniature:
+        embed.set_thumbnail(url=miniature)
+    if image:
+        embed.set_image(url=image)
+    pied = footer or (guild.name if guild else None)
+    if pied:
+        embed.set_footer(text=pied, icon_url=icone)
+    return embed
+
+
+class EmbedModal(discord.ui.Modal, title="Create an embed"):
+    titre = discord.ui.TextInput(label="Title", required=False, max_length=256)
+    description = discord.ui.TextInput(
+        label="Description", style=discord.TextStyle.paragraph, required=True, max_length=4000
+    )
+    footer = discord.ui.TextInput(label="Footer (optional)", required=False, max_length=2048)
+    image = discord.ui.TextInput(label="Big image URL (optional)", required=False, max_length=500)
+    thumbnail = discord.ui.TextInput(label="Small image URL (optional)", required=False, max_length=500)
+
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        image = self.image.value.strip()
+        miniature = self.thumbnail.value.strip()
+        for url in (image, miniature):
+            if url and not _url_ok(url):
+                await interaction.response.send_message(
+                    f"❌ `{url}` is not a valid link (it must start with https://).", ephemeral=True
+                )
+                return
+
+        embed = construire_embed(
+            interaction.guild,
+            self.titre.value.strip(),
+            self.description.value,
+            footer=self.footer.value.strip() or None,
+            image=image or None,
+            thumbnail=miniature or None,
+        )
+
+        try:
+            await self.channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ I can't send messages in {self.channel.mention}.", ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"❌ Discord error: {e}", ephemeral=True)
+            return
+        await interaction.response.send_message(f"✅ Embed sent in {self.channel.mention}.", ephemeral=True)
+
+
+@tree.command(name="embed", description="Send a purple embed message (opens a form)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="Where to send it (default: this channel)")
+async def embed_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    await interaction.response.send_modal(EmbedModal(channel or interaction.channel))
+
+
+@tree.command(name="button", description="Post the green 'Accept rules' button")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    channel="Where to post it (default: this channel)",
+    message_id="Optional: ID of a message from me (e.g. a /embed) to attach the button to",
+)
+async def button_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None,
+    message_id: str = None,
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    cible = channel or interaction.channel
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if message_id:
+            try:
+                msg = await cible.fetch_message(int(message_id.strip()))
+            except (ValueError, discord.NotFound):
+                await interaction.followup.send("❌ Message not found in that channel.", ephemeral=True)
+                return
+            if msg.author.id != client.user.id:
+                await interaction.followup.send(
+                    "❌ I can only add the button to my own messages (send it with /embed first).",
+                    ephemeral=True,
+                )
+                return
+            await msg.edit(view=RulesView())
+        else:
+            embed = construire_embed(
+                interaction.guild,
+                "📜 Rules",
+                "Click the button below to accept the rules and get access to the server.",
+            )
+            await cible.send(embed=embed, view=RulesView())
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ I can't send messages in {cible.mention}.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Discord error: {e}", ephemeral=True)
+        return
+    await interaction.followup.send(f"✅ Button posted in {cible.mention}.", ephemeral=True)
+
+
+# ---------- ALERTES ABONNÉS TIKTOK (paliers) ----------
+# Les comptes suivis et leur message se règlent avec les commandes /tiktokadd, /tiktokremove, /tiktokcheck.
+# Paliers : tous les 1000 jusqu'à 10k, tous les 5000 de 10k à 50k, tous les 10000 à partir de 50k.
+TIKTOK_INTERVALLE_MIN = 15           # fréquence des vérifications
+FICHIER_TIKTOK = "tiktok_paliers.json"          # derniers paliers annoncés
+FICHIER_TIKTOK_COMPTES = "tiktok_comptes.json"  # comptes suivis + messages (MongoDB)
+MESSAGE_TIKTOK_DEFAUT = "Yoo @everyone {user} has just reached {count} followers tysm all"
+COMPTES_TIKTOK_DEFAUT = {
+    "911_editzs": {"username": "911_editzs", "message": MESSAGE_TIKTOK_DEFAUT, "ping_id": None},
+    "traxmilrz": {"username": "traxmilrz", "message": MESSAGE_TIKTOK_DEFAUT, "ping_id": None},
+}
+
+
+def calculer_palier(n: int) -> int:
+    """Palier atteint pour n abonnés : 1000 par 1000 (<10k), 5000 par 5000 (10k-50k), 10000 par 10000 (50k+)."""
+    if n < 10_000:
+        pas = 1000
+    elif n < 50_000:
+        pas = 5000
+    else:
+        pas = 10_000
+    return (n // pas) * pas
+
+
+def formater_palier(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.3f}".rstrip("0").rstrip(".") + "M"
+    return f"{n // 1000}k"
+
+
+def charger_comptes_tiktok():
+    try:
+        data = storage.charger(FICHIER_TIKTOK_COMPTES)
+    except Exception as e:
+        print(f"[TIKTOK] Lecture des comptes impossible : {e}")
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
+        return data["accounts"]
+    return {k: dict(v) for k, v in COMPTES_TIKTOK_DEFAUT.items()}
+
+
+def sauver_comptes_tiktok(comptes):
+    storage.sauver(FICHIER_TIKTOK_COMPTES, {"accounts": comptes})
+
+
+def _charger_paliers():
+    try:
+        d = storage.charger(FICHIER_TIKTOK)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def texte_alerte(compte, palier):
+    nom = f"<@{compte['ping_id']}>" if compte.get("ping_id") else f"**{compte['username']}**"
+    modele = compte.get("message") or MESSAGE_TIKTOK_DEFAUT
+    return modele.replace("{user}", nom).replace("{count}", f"**{formater_palier(palier)}**")
+
+
+async def abonnes_via_livecounts(session, pseudo):
+    """Récupère le nombre d'abonnés via l'API utilisée par livecounts.io (tokcounter).
+    Plus fiable que le scrape direct de tiktok.com (souvent bloqué)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "*/*",
+        "Origin": "https://livecounts.io",
+        "Referer": "https://livecounts.io/",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    # 1) Recherche du userId à partir du username
+    url_search = f"https://tiktok-api.tokcounter.com/user/search/{pseudo}"
+    async with session.get(url_search, headers=headers, timeout=timeout) as r:
+        if r.status != 200:
+            raise RuntimeError(f"search HTTP {r.status}")
+        data = await r.json()
+    if not data.get("success"):
+        raise RuntimeError(f"search failed: {data}")
+    users = data.get("userData") or []
+    if not users:
+        raise RuntimeError("aucun résultat pour ce username")
+
+    # Prend le premier résultat dont le username match (insensible à la casse), sinon le 1er
+    choisi = None
+    pseudo_l = pseudo.lower().lstrip("@")
+    for u in users:
+        # certains résultats ont "id" = handle, d'autres "username" = display name
+        handle = str(u.get("id") or "").lower()
+        if handle == pseudo_l:
+            choisi = u
+            break
+    if choisi is None:
+        choisi = users[0]
+
+    user_id = choisi.get("userId") or choisi.get("id")
+    if not user_id:
+        raise RuntimeError("userId manquant dans la réponse search")
+
+    # Si le search renvoie déjà les stats, on les utilise
+    stats = choisi.get("stats") or {}
+    if stats.get("followers") is not None:
+        return int(stats["followers"])
+
+    # 2) Sinon, appel stats
+    url_stats = f"https://tiktok-api.tokcounter.com/user/stats/{user_id}"
+    async with session.get(url_stats, headers=headers, timeout=timeout) as r:
+        if r.status != 200:
+            raise RuntimeError(f"stats HTTP {r.status}")
+        data = await r.json()
+    if not data.get("success"):
+        raise RuntimeError(f"stats failed: {data}")
+    if data.get("followerCount") is None:
+        raise RuntimeError("followerCount manquant")
+    return int(data["followerCount"])
+
+
+async def abonnes_direct(session, pseudo):
+    """Fallback : lit le nombre d'abonnés sur la page publique TikTok (souvent bloqué)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    async with session.get(f"https://www.tiktok.com/@{pseudo}", headers=headers,
+                           timeout=aiohttp.ClientTimeout(total=20)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        html = await r.text()
+    m = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise RuntimeError("page sans données (probablement bloquée)")
+    data = json.loads(m.group(1))
+    info = data["__DEFAULT_SCOPE__"]["webapp.user-detail"]["userInfo"]
+    stats = info.get("statsV2") or info.get("stats")
+    return int(stats["followerCount"])
+
+
+async def recuperer_abonnes(pseudos):
+    """Retourne {pseudo: nombre}. Essaie livecounts/tokcounter puis scrape TikTok en secours."""
+    comptes = {}
+    async with aiohttp.ClientSession() as session:
+        for pseudo in pseudos:
+            try:
+                comptes[pseudo] = await abonnes_via_livecounts(session, pseudo)
+                print(f"[TIKTOK] @{pseudo} : {comptes[pseudo]:,} (via livecounts/tokcounter)")
+            except Exception as e1:
+                print(f"[TIKTOK] livecounts échoué pour @{pseudo} : {e1} — essai scrape direct…")
+                try:
+                    comptes[pseudo] = await abonnes_direct(session, pseudo)
+                    print(f"[TIKTOK] @{pseudo} : {comptes[pseudo]:,} (via scrape tiktok.com)")
+                except Exception as e2:
+                    print(f"[TIKTOK] Lecture impossible pour @{pseudo} : {e2}")
+    return comptes
+
+
+async def _envoyer_alerte_tiktok(compte, palier):
+    canal = client.get_channel(RAID_ANNOUNCE_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await client.fetch_channel(RAID_ANNOUNCE_CHANNEL_ID)
+        except Exception as e:
+            print(f"[TIKTOK] Salon d'alerte introuvable : {e}")
+            return False
+    try:
+        await canal.send(
+            texte_alerte(compte, palier)[:2000],
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=True),
+        )
+        return True
+    except discord.Forbidden:
+        print("[TIKTOK] Pas la permission d'écrire / de mentionner @everyone dans le salon d'alerte.")
+    except discord.HTTPException as e:
+        print(f"[TIKTOK] Erreur d'envoi : {e}")
+    return False
+
+
+@tasks.loop(minutes=TIKTOK_INTERVALLE_MIN)
+async def verif_tiktok():
+    config = charger_comptes_tiktok()
+    if not config:
+        return
+    lus = await recuperer_abonnes([c["username"] for c in config.values()])
+    if not lus:
+        return
+
+    etat = _charger_paliers()
+    modifie = False
+    for cle, compte in config.items():
+        nombre = lus.get(compte["username"])
+        if nombre is None:
+            continue
+        palier = calculer_palier(nombre)
+        precedent = etat.get(cle, {}).get("palier")
+        if precedent is None:
+            # Première observation : on mémorise sans alerter
+            etat[cle] = {"palier": palier}
+            modifie = True
+            print(f"[TIKTOK] @{compte['username']} : {nombre} abonnés (palier de départ {palier}).")
+        elif palier > precedent:
+            if await _envoyer_alerte_tiktok(compte, palier):
+                etat[cle] = {"palier": palier}  # le palier ne redescend jamais : pas de double alerte
+                modifie = True
+    if modifie:
+        try:
+            storage.sauver(FICHIER_TIKTOK, etat)
+        except Exception as e:
+            print(f"[TIKTOK] Sauvegarde impossible : {e}")
+
+
+@verif_tiktok.before_loop
+async def _avant_verif_tiktok():
+    await client.wait_until_ready()
+
+
+@tree.command(name="tiktokadd", description="Track a TikTok account and set the alert message")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    username="TikTok username (without @)",
+    message="Alert text. Use {user} for the name/ping and {count} for the number. Optional.",
+    ping="Discord member to ping instead of the TikTok name. Optional.",
+)
+async def tiktokadd(
+    interaction: discord.Interaction,
+    username: str,
+    message: str = None,
+    ping: discord.Member = None,
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    pseudo = username.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,24}", pseudo):
+        await interaction.response.send_message(
+            "❌ Invalid TikTok username (letters, numbers, `.` and `_` only).", ephemeral=True
+        )
+        return
+    if message is not None and len(message) > 1500:
+        await interaction.response.send_message("❌ Message too long (1500 characters max).", ephemeral=True)
+        return
+
+    comptes = charger_comptes_tiktok()
+    cle = pseudo.lower()
+    ancien = comptes.get(cle, {})
+    compte = {
+        "username": pseudo,
+        "message": message if message is not None else ancien.get("message", MESSAGE_TIKTOK_DEFAUT),
+        "ping_id": ping.id if ping is not None else ancien.get("ping_id"),
+    }
+    comptes[cle] = compte
+    try:
+        sauver_comptes_tiktok(comptes)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Storage error: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ **@{pseudo}** is tracked (every 1k below 10k, every 5k from 10k, every 10k from 50k).\n"
+        f"Preview of the alert:\n>>> {texte_alerte(compte, 10000)}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="tiktokremove", description="Stop tracking a TikTok account")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(username="TikTok username (without @)")
+async def tiktokremove(interaction: discord.Interaction, username: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    cle = username.strip().lstrip("@").lower()
+    comptes = charger_comptes_tiktok()
+    if cle not in comptes:
+        await interaction.response.send_message("This account is not tracked.", ephemeral=True)
+        return
+    comptes.pop(cle)
+    try:
+        sauver_comptes_tiktok(comptes)
+        etat = _charger_paliers()
+        if etat.pop(cle, None) is not None:
+            storage.sauver(FICHIER_TIKTOK, etat)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Storage error: {e}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ **@{cle}** is no longer tracked.", ephemeral=True)
+
+
+@tree.command(name="tiktokcheck", description="Show the tracked TikTok accounts and their current follower counts")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def tiktokcheck(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    config = charger_comptes_tiktok()
+    if not config:
+        await interaction.response.send_message("No TikTok account tracked. Use /tiktokadd.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    lus = await recuperer_abonnes([c["username"] for c in config.values()])
+    etat = _charger_paliers()
+    lignes = []
+    for cle, compte in config.items():
+        pseudo = compte["username"]
+        ping = f", pings <@{compte['ping_id']}>" if compte.get("ping_id") else ""
+        if pseudo in lus:
+            palier = etat.get(cle, {}).get("palier")
+            suivi = f", last alerted: {formater_palier(palier)}" if palier else ""
+            lignes.append(f"**@{pseudo}** : {lus[pseudo]:,} followers{suivi}{ping}")
+        else:
+            lignes.append(f"**@{pseudo}** : ❌ could not be read (TikTok may be blocking the server){ping}")
+    await interaction.followup.send(
+        "\n".join(lignes), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
 @client.event
 async def on_member_ban(guild, user):
     if (guild.id, user.id) in honey_softban or (guild.id, user.id) in sanction_cmd:
@@ -500,6 +1334,17 @@ async def on_audit_log_entry_create(entry):
     dsstat_audit(entry)  # rapport quotidien : kicks / bans / timeouts
     if entry.action == discord.AuditLogAction.kick and entry.target:
         expulses.add((entry.guild.id, entry.target.id))
+
+    # --- Anti-nuke ---
+    try:
+        if entry.action == discord.AuditLogAction.channel_delete:
+            await antinuke_traiter_channel_delete(entry)
+        elif entry.action == discord.AuditLogAction.role_update:
+            await antinuke_traiter_role_update(entry)
+        elif entry.action == discord.AuditLogAction.member_role_update:
+            await antinuke_traiter_member_role_update(entry)
+    except Exception as e:
+        print(f"[ANTINUKE] Erreur traitement audit : {e}")
 
 
 @client.event
@@ -546,6 +1391,52 @@ REGEX_INVITATION = re.compile(
 
 def contient_invitation_discord(texte):
     return bool(REGEX_INVITATION.search(texte))
+
+
+# ---------- ANTI MUR DE TEXTE ----------
+def est_mur_de_texte(contenus):
+    """Vrai si un des textes est trop long ou a trop de lignes."""
+    for texte in contenus:
+        if not texte:
+            continue
+        if len(texte) > TEXTWALL_MAX_CARACTERES:
+            return True
+        if texte.count("\n") + 1 > TEXTWALL_MAX_LIGNES:
+            return True
+    return False
+
+
+async def sanctionner_mur_de_texte(message, membre):
+    """Même sanction que le spam : message supprimé + timeout 1 heure."""
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        print("[ERREUR] Il me manque la permission 'Gérer les messages'.")
+    except discord.NotFound:
+        pass
+
+    if membre.is_timed_out():
+        return
+    try:
+        await membre.timeout(DUREE_TIMEOUT_SPAM, reason="Text wall (timeout 1 hour)")
+        await message.channel.send(f"{membre.mention} has been muted for spamming")
+        await envoyer_log(
+            message.guild,
+            "🔇 Mute — Text wall",
+            f"**User:** {membre.mention} (`{membre.id}`)\n"
+            f"**Channel:** {message.channel.mention}\n"
+            f"**Reason:** Message too long ({len(message.content)} characters, "
+            f"{message.content.count(chr(10)) + 1} lines)\n"
+            f"**Duration:** 1 hour",
+            discord.Color.orange(),
+        )
+    except discord.Forbidden:
+        print(
+            f"[ERREUR] Impossible de mute {membre} : permission 'Exclure temporairement "
+            f"des membres' manquante, ou son rôle est au-dessus de celui du bot."
+        )
+    except discord.HTTPException as e:
+        print(f"[ERREUR] Timeout impossible : {e}")
 
 
 # ---------- ANTI-SPAM ----------
@@ -647,14 +1538,14 @@ async def avant_maj_stats():
     await client.wait_until_ready()
 
 
-@tree.command(name="setupstat", description="Crée la catégorie de statistiques avec 3 compteurs de rôles")
+@tree.command(name="setupstat", description="Create the stats category with 3 role counters")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    role1="Premier rôle à compter", texte1="Texte affiché pour le premier compteur",
-    role2="Deuxième rôle à compter", texte2="Texte affiché pour le deuxième compteur",
-    role3="Troisième rôle à compter", texte3="Texte affiché pour le troisième compteur",
-    categorie="Nom de la catégorie (facultatif)",
+    role1="First role to count", texte1="Label for the first counter",
+    role2="Second role to count", texte2="Label for the second counter",
+    role3="Third role to count", texte3="Label for the third counter",
+    categorie="Category name (optional)",
 )
 async def setupstat(
     interaction: discord.Interaction,
@@ -664,7 +1555,7 @@ async def setupstat(
     categorie: str = "📊 Server Stats",
 ):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -717,6 +1608,107 @@ async def setupstat(
         ephemeral=True,
     )
 
+@tree.command(
+    name="checkmembers",
+    description="Check that the bot sees the member count and the stats channels status",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    force_update="Si True, force immédiatement la mise à jour des salons stats",
+)
+async def checkmembers(interaction: discord.Interaction, force_update: bool = False):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    total_officiel = guild.member_count
+    caches = list(guild.members)
+    nb_cache = len(caches)
+    bots = sum(1 for m in caches if m.bot)
+    humains_cache = nb_cache - bots
+    ecart = (total_officiel - nb_cache) if total_officiel is not None else None
+
+    lignes = [
+        f"**Serveur :** {guild.name}",
+        f"**Total Discord (`guild.member_count`) :** **{total_officiel}**",
+        (
+            f"**Membres en cache (`len(guild.members)`) :** **{nb_cache}** "
+            f"(humains ≈ {humains_cache}, bots ≈ {bots})"
+        ),
+    ]
+    if ecart is not None and abs(ecart) > 2:
+        lignes.append(
+            f"⚠️ **Écart cache/total : {ecart:+d}** — le bot n'a peut-être pas encore "
+            "chargé tous les membres en mémoire (normal sur les gros serveurs). "
+            "Le total Discord reste la référence."
+        )
+    else:
+        lignes.append("✅ Cache et total Discord sont alignés.")
+
+    lignes.append("**Members intent :** oui (`intents.members = True`)")
+
+    data = charger_stats()
+    config = data.get(str(guild.id))
+    if not config:
+        lignes.append("\n**Salons stats :** ❌ pas configurés (`/setupstat`).")
+    else:
+        lignes.append("\n**Salons stats (auto toutes les 6 min) :**")
+        for entree in config.get("salons", []):
+            salon = guild.get_channel(entree["salon_id"])
+            role = guild.get_role(entree["role_id"])
+            if role is None:
+                lignes.append(f"• rôle `{entree['role_id']}` introuvable")
+                continue
+            compte = compter(role)
+            attendu = f"{entree['texte']} : {compte}"[:100]
+            if salon is None:
+                lignes.append(
+                    f"• salon manquant pour **{entree['texte']}** "
+                    f"(rôle {role.mention} → **{compte}**)"
+                )
+            else:
+                ok = "✅" if salon.name == attendu else "⏳"
+                lignes.append(
+                    f"• {ok} {salon.mention}\n"
+                    f"  actuel : `{salon.name}`\n"
+                    f"  calculé : `{attendu}` (rôle {role.mention})"
+                )
+
+        if force_update:
+            try:
+                await mettre_a_jour_guild(guild, config)
+                lignes.append(
+                    "\n🔄 **Mise à jour forcée envoyée.** "
+                    "Discord limite à 2 renommages / 10 min par salon."
+                )
+            except Exception as e:
+                lignes.append(f"\n❌ Échec mise à jour forcée : `{e}`")
+        else:
+            lignes.append(
+                "\n_Astuce : `force_update: True` pour pousser la mise à jour tout de suite "
+                "(limite Discord : 2 renommages / 10 min)._"
+            )
+
+    lignes.append(
+        "\n📌 Les compteurs `/setupstat` affichent le nombre de **membres ayant le rôle choisi**, "
+        "pas automatiquement le total du serveur. "
+        "Pour un compteur « total membres », utilise un rôle que tout le monde a "
+        "(ex. rôle règles / membre)."
+    )
+
+    texte = "\n".join(lignes)
+    if len(texte) <= 1900:
+        await interaction.followup.send(texte, ephemeral=True)
+    else:
+        await interaction.followup.send(texte[:1900], ephemeral=True)
+        if len(texte) > 1900:
+            await interaction.followup.send(texte[1900:3800], ephemeral=True)
+
+
 
 # ---------- HONEYPOT ----------
 FICHIER_HONEY = "honeypot_config.json"
@@ -760,12 +1752,12 @@ class HoneypotCounterView(discord.ui.View):
         )
 
 
-@tree.command(name="setuphoney", description="Crée un salon piège : celui qui y écrit est banni puis débanni")
+@tree.command(name="setuphoney", description="Create a honeypot channel: anyone who writes there is softbanned")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def setuphoney(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1622,6 +2614,810 @@ async def importlevels_cmd(interaction: discord.Interaction):
     await interaction.followup.send(texte, ephemeral=True)
 
 
+
+# ---------- TELECHARGEMENT VIDEO (/dl) ----------
+# Commande slash : /dl link:<url>
+# Sites : TikTok, Streamable (via yt-dlp) — YouTube retiré
+# Gros fichiers : litterbox.catbox.moe (lien auto-supprime apres 24 h)
+# Prerequis serveur : pip install yt-dlp
+
+DL_MAX_OCTETS = 200 * 1024 * 1024  # 200 Mo max telechargement
+DL_TIMEOUT_SEC = 240
+REGEX_URL_VIDEO = re.compile(
+    r"https?://(?:www\.)?"
+    r"(?:"
+    r"tiktok\.com/[^\s]+|vm\.tiktok\.com/[^\s]+|vt\.tiktok\.com/[^\s]+"
+    r"|streamable\.com/[^\s]+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def extraire_url_video(texte: str) -> str | None:
+    if not texte:
+        return None
+    m = REGEX_URL_VIDEO.search(texte)
+    return m.group(0).rstrip(")>.,]") if m else None
+
+
+async def telecharger_video(url: str, dossier: str) -> tuple[str | None, str | None]:
+    """Télécharge une vidéo TikTok / Streamable avec yt-dlp. Retourne (chemin, erreur)."""
+    os.makedirs(dossier, exist_ok=True)
+    sortie = os.path.join(dossier, "%(id)s.%(ext)s")
+
+    proxy = (
+        os.getenv("YTDLP_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or ""
+    ).strip()
+
+    opts = {
+        "outtmpl": sortie,
+        "format": "mp4/bestvideo*+bestaudio/best/best",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "max_filesize": DL_MAX_OCTETS,
+        "nocheckcertificate": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    if proxy:
+        opts["proxy"] = proxy
+
+    def _run():
+        try:
+            import yt_dlp
+        except ImportError:
+            return None, (
+                "yt-dlp is not installed. Add `yt-dlp[default]>=2025.1.0` to requirements.txt "
+                "then redeploy with clear build cache."
+            )
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info is None:
+                    return None, "Could not extract the video."
+                chemin = ydl.prepare_filename(info)
+                if not os.path.exists(chemin):
+                    base, _ = os.path.splitext(chemin)
+                    for ext in (".mp4", ".webm", ".mkv", ".mov"):
+                        if os.path.exists(base + ext):
+                            chemin = base + ext
+                            break
+                if not os.path.exists(chemin):
+                    return None, "Downloaded file not found."
+                taille = os.path.getsize(chemin)
+                if taille > DL_MAX_OCTETS:
+                    try:
+                        os.remove(chemin)
+                    except OSError:
+                        pass
+                    return None, (
+                        f"Video too large ({taille // (1024 * 1024)} MB). "
+                        f"Bot limit = {DL_MAX_OCTETS // (1024 * 1024)} MB."
+                    )
+                if taille == 0:
+                    try:
+                        os.remove(chemin)
+                    except OSError:
+                        pass
+                    return None, "Empty file."
+                return chemin, None
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            if "unsupported url" in low or "no video" in low:
+                return None, "Unsupported link or no video found."
+            if "private" in low:
+                return None, "Private / inaccessible video."
+            if any(s in low for s in ("youtube", "youtu.be")):
+                return None, "YouTube is not supported. Use a **TikTok** or **Streamable** link."
+            return None, f"yt-dlp error: {msg[:280]}"
+
+    return await asyncio.to_thread(_run)
+
+
+async def upload_temporaire(chemin: str) -> tuple[str | None, str | None]:
+    """Upload temporaire avec plusieurs hebergeurs en secours.
+    1) litterbox 24h (jusqu'a ~1 Go)
+    2) 0x0.st (retention selon taille)
+    3) gofile.io (gros fichiers)
+    Retourne (url, erreur).
+    """
+
+    def _multipart(fields: dict, file_field: str, filename: str, data: bytes, content_type="application/octet-stream"):
+        import uuid
+        boundary = "----WebKitFormBoundary" + uuid.uuid4().hex[:16]
+        chunks = []
+        for name, value in fields.items():
+            chunks.append(
+                ("--" + boundary + "\r\n"
+                 + 'Content-Disposition: form-data; name="' + name + '"\r\n\r\n'
+                 + str(value) + "\r\n").encode("utf-8")
+            )
+        chunks.append(
+            ("--" + boundary + "\r\n"
+             + 'Content-Disposition: form-data; name="' + file_field
+             + '"; filename="' + filename + '"\r\n'
+             + "Content-Type: " + content_type + "\r\n\r\n").encode("utf-8")
+        )
+        chunks.append(data)
+        chunks.append(("\r\n--" + boundary + "--\r\n").encode("utf-8"))
+        body = b"".join(chunks)
+        return body, boundary
+
+    def _post(url, body, boundary, timeout=180):
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "multipart/form-data; boundary=" + boundary,
+                "User-Agent": "Mozilla/5.0 (compatible; DiscordBot/1.0)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace").strip()
+
+    def _litterbox(data, filename):
+        body, boundary = _multipart(
+            {"reqtype": "fileupload", "time": "24h"},
+            "fileToUpload",
+            filename,
+            data,
+        )
+        texte = _post(
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+            body,
+            boundary,
+        )
+        if texte.startswith("https://"):
+            return texte, None
+        return None, "litterbox: " + texte[:180]
+
+    def _zero_x_zero(data, filename):
+        body, boundary = _multipart({}, "file", filename, data)
+        texte = _post("https://0x0.st", body, boundary)
+        if texte.startswith("https://"):
+            return texte, None
+        return None, "0x0.st: " + texte[:180]
+
+    def _gofile(data, filename):
+        import urllib.request
+        import json
+        with urllib.request.urlopen("https://api.gofile.io/servers", timeout=30) as r:
+            info = json.loads(r.read().decode())
+        servers = info.get("data", {}).get("servers") or []
+        if not servers:
+            return None, "gofile: aucun serveur"
+        server = servers[0]["name"]
+        body, boundary = _multipart({}, "file", filename, data)
+        texte = _post(f"https://{server}.gofile.io/uploadFile", body, boundary, timeout=240)
+        try:
+            payload = json.loads(texte)
+        except Exception:
+            return None, "gofile: reponse invalide"
+        if payload.get("status") != "ok":
+            return None, "gofile: " + str(payload)[:180]
+        link = payload.get("data", {}).get("downloadPage") or payload.get("data", {}).get("directLink")
+        if not link:
+            return None, "gofile: pas de lien"
+        return link, None
+
+    def _run():
+        filename = os.path.basename(chemin)
+        with open(chemin, "rb") as f:
+            data = f.read()
+        erreurs = []
+        for nom, fn in (
+            ("litterbox", _litterbox),
+            ("0x0.st", _zero_x_zero),
+            ("gofile", _gofile),
+        ):
+            try:
+                url, err = fn(data, filename)
+                if url:
+                    return url, None
+                erreurs.append(err or nom)
+            except Exception as e:
+                erreurs.append(f"{nom}: {e}")
+        return None, "Tous les hebergeurs ont echoue — " + " | ".join(erreurs)[:300]
+
+    return await asyncio.to_thread(_run)
+
+
+def extraire_url_depuis_message(message: discord.Message) -> str | None:
+    """Cherche une URL vidéo dans le contenu, les embeds ou les pièces jointes vidéo."""
+    textes = [message.content or ""]
+    for emb in getattr(message, "embeds", []) or []:
+        if emb.url:
+            textes.append(emb.url)
+        if emb.description:
+            textes.append(emb.description)
+        if emb.title:
+            textes.append(emb.title)
+        if getattr(emb, "author", None) and getattr(emb.author, "url", None):
+            textes.append(emb.author.url)
+    for t in textes:
+        url = extraire_url_video(t)
+        if url:
+            return url
+    # Pièce jointe vidéo déjà sur Discord
+    for att in getattr(message, "attachments", []) or []:
+        ct = (att.content_type or "").lower()
+        fn = (att.filename or "").lower()
+        if ct.startswith("video/") or fn.endswith((".mp4", ".webm", ".mov", ".mkv")):
+            return att.url
+    return None
+
+
+def _url_video_valide(url: str) -> bool:
+    if not url:
+        return False
+    if REGEX_URL_VIDEO.search(url):
+        return True
+    return any(s in url.lower() for s in ("tiktok", "streamable"))
+
+
+async def _pipeline_dl(url: str, *, guild, author, statut_msg, dossier_id, channel, reference_msg=None):
+    """Logique commune de téléchargement (slash, menu contextuel ou !dl en réponse)."""
+    dossier = os.path.join("/tmp", "dl_" + str(dossier_id))
+    chemin = None
+    try:
+        chemin, err = await telecharger_video(url, dossier)
+        if err or not chemin:
+            await statut_msg.edit(content="Failed: " + (err or "download impossible"))
+            return
+
+        taille = os.path.getsize(chemin)
+        taille_mo = taille / (1024 * 1024)
+        limite_discord = getattr(guild, "filesize_limit", None) or (25 * 1024 * 1024)
+
+        if taille <= limite_discord:
+            await statut_msg.edit(content="Sending to Discord ({:.1f} MB)...".format(taille_mo))
+            try:
+                kwargs = {
+                    "content": "Video requested by " + author.mention,
+                    "file": discord.File(chemin, filename=os.path.basename(chemin)),
+                    "mention_author": False,
+                }
+                if reference_msg is not None:
+                    await reference_msg.reply(**kwargs)
+                else:
+                    await channel.send(
+                        content=kwargs["content"],
+                        file=kwargs["file"],
+                    )
+                try:
+                    await statut_msg.delete()
+                except discord.HTTPException:
+                    pass
+                return
+            except discord.HTTPException:
+                await statut_msg.edit(
+                    content=(
+                        "Discord upload refused. Temporary 24h upload ({:.1f} MB)...".format(
+                            taille_mo
+                        )
+                    )
+                )
+        else:
+            await statut_msg.edit(
+                content=(
+                    "File too large for Discord ({:.1f} MB). "
+                    "Temporary 24h upload...".format(taille_mo)
+                )
+            )
+
+        lien, err_up = await upload_temporaire(chemin)
+        if err_up or not lien:
+            await statut_msg.edit(content="Upload failed: " + (err_up or "unknown"))
+            return
+
+        await statut_msg.edit(
+            content=(
+                "Video requested by "
+                + author.mention
+                + "\n**Temporary link:** "
+                + lien
+                + "\nSize: {:.1f} MB".format(taille_mo)
+            )
+        )
+    except Exception as e:
+        try:
+            await statut_msg.edit(content="Error: " + str(e))
+        except Exception:
+            pass
+    finally:
+        try:
+            if chemin and os.path.exists(chemin):
+                os.remove(chemin)
+            if os.path.isdir(dossier):
+                for nom in os.listdir(dossier):
+                    try:
+                        os.remove(os.path.join(dossier, nom))
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(dossier)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+async def executer_dl(interaction: discord.Interaction, url: str):
+    """Télécharge via une interaction (slash ou menu contextuel)."""
+    await interaction.response.defer()
+    statut_msg = await interaction.followup.send("Download in progress...")
+    await _pipeline_dl(
+        url,
+        guild=interaction.guild,
+        author=interaction.user,
+        statut_msg=statut_msg,
+        dossier_id=interaction.id,
+        channel=interaction.channel,
+        reference_msg=None,
+    )
+
+
+async def executer_dl_message(message: discord.Message, url: str):
+    """Télécharge en répondant à un message (commande !dl)."""
+    statut_msg = await message.reply("Download in progress...", mention_author=False)
+    await _pipeline_dl(
+        url,
+        guild=message.guild,
+        author=message.author,
+        statut_msg=statut_msg,
+        dossier_id=message.id,
+        channel=message.channel,
+        reference_msg=message,
+    )
+
+
+async def traiter_dl_message(message: discord.Message):
+    """!dl en réponse à un message, ou !dl <url>."""
+    contenu = (message.content or "").strip()
+    url = None
+
+    parties = contenu.split(None, 1)
+    if len(parties) == 2:
+        url = extraire_url_video(parties[1]) or parties[1].strip()
+
+    if url is None and message.reference:
+        ref = message.reference
+        cible = ref.resolved
+        if cible is None and ref.message_id:
+            try:
+                cible = await message.channel.fetch_message(ref.message_id)
+            except (discord.NotFound, discord.HTTPException):
+                cible = None
+        if cible is not None:
+            # Fichier vidéo déjà uploadé sur Discord
+            for att in getattr(cible, "attachments", []) or []:
+                ct = (att.content_type or "").lower()
+                fn = (att.filename or "").lower()
+                if ct.startswith("video/") or fn.endswith((".mp4", ".webm", ".mov", ".mkv")):
+                    try:
+                        await message.reply(
+                            file=await att.to_file(),
+                            mention_author=False,
+                        )
+                        return
+                    except Exception:
+                        await message.reply(
+                            "File already on Discord: " + att.url,
+                            mention_author=False,
+                        )
+                        return
+            url = extraire_url_depuis_message(cible)
+
+    if not url:
+        await message.reply(
+            "Reply to a message with a **TikTok / Streamable** link using `!dl`, "
+            "or send `!dl <url>`.\n"
+            "You can also use `/dl` or right-click → **Apps** → **Download video**.",
+            mention_author=False,
+        )
+        return
+
+    if not _url_video_valide(url):
+        await message.reply(
+            "Unrecognized link. Supported: **TikTok** and **Streamable**.",
+            mention_author=False,
+        )
+        return
+
+    await executer_dl_message(message, url)
+
+
+@tree.command(
+    name="dl",
+    description="Download a TikTok or Streamable video",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    link="TikTok or Streamable URL (optional if you use Apps → Download video)",
+)
+async def dl_cmd(interaction: discord.Interaction, link: Optional[str] = None):
+    """Slash /dl — link is optional. To download from a message, right-click it → Apps → Download video."""
+    url = None
+    if link and link.strip():
+        url = extraire_url_video(link) or link.strip()
+
+    if not url:
+        await interaction.response.send_message(
+            "Provide a **TikTok / Streamable** link, or right-click a message "
+            "→ **Apps** → **Download video**.",
+            ephemeral=True,
+        )
+        return
+
+    if not _url_video_valide(url):
+        await interaction.response.send_message(
+            "Unrecognized link. Supported: **TikTok** and **Streamable**.",
+            ephemeral=True,
+        )
+        return
+
+    await executer_dl(interaction, url)
+
+
+@tree.context_menu(name="Download video")
+@app_commands.guild_only()
+async def dl_context_menu(interaction: discord.Interaction, message: discord.Message):
+    """Right-click a message → Apps → Download video (works like replying with !dl)."""
+    # Pièce jointe vidéo déjà sur Discord : renvoyer le fichier directement
+    for att in getattr(message, "attachments", []) or []:
+        ct = (att.content_type or "").lower()
+        fn = (att.filename or "").lower()
+        if ct.startswith("video/") or fn.endswith((".mp4", ".webm", ".mov", ".mkv")):
+            try:
+                await interaction.response.defer()
+                await interaction.followup.send(
+                    content="Video requested by " + interaction.user.mention,
+                    file=await att.to_file(),
+                )
+                return
+            except Exception:
+                await interaction.response.send_message(
+                    "File already on Discord: " + att.url,
+                    ephemeral=True,
+                )
+                return
+
+    url = extraire_url_depuis_message(message)
+    if not url:
+        await interaction.response.send_message(
+            "No **TikTok / Streamable** link found in that message.",
+            ephemeral=True,
+        )
+        return
+
+    if not _url_video_valide(url):
+        await interaction.response.send_message(
+            "Unrecognized link. Supported: **TikTok** and **Streamable**.",
+            ephemeral=True,
+        )
+        return
+
+    await executer_dl(interaction, url)
+
+
+
+
+
+# ---------- RECONNAISSANCE MUSICALE (/songfinder) ----------
+# Léger en RAM : on n'utilise PAS de modèle local.
+# 1) extrait ~12 s d'audio compressé (ffmpeg)  2) envoie à Shazam via shazamio
+# Prérequis : pip install shazamio   (+ ffmpeg sur la machine si possible)
+MUSIC_MAX_OCTETS = 8 * 1024 * 1024   # 8 Mo max (pièce jointe)
+MUSIC_SAMPLE_SEC = 12                # seules les 12 premières secondes sont analysées
+MUSIC_TIMEOUT_SEC = 45
+
+
+async def _music_extraire_echantillon(src: str, dest: str) -> tuple[bool, str]:
+    """Réduit le fichier à un court extrait mono basse qualité pour limiter RAM/CPU/réseau.
+    Retourne (ok, message_erreur). Si ffmpeg est absent, copie simplement la source."""
+    def _run():
+        import shutil
+        import subprocess
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            # Pas de ffmpeg : on utilise le fichier tel quel (moins optimal mais fonctionnel)
+            shutil.copy2(src, dest)
+            return True, ""
+        try:
+            # -t durée, mono, 16 kHz, 64 kb/s → extrait tout petit
+            cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src,
+                "-t", str(MUSIC_SAMPLE_SEC),
+                "-vn",
+                "-ac", "1",
+                "-ar", "16000",
+                "-b:a", "64k",
+                dest,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            if proc.returncode != 0 or not os.path.exists(dest) or os.path.getsize(dest) == 0:
+                # Fallback : fichier original
+                shutil.copy2(src, dest)
+            return True, ""
+        except Exception as e:
+            try:
+                shutil.copy2(src, dest)
+                return True, ""
+            except Exception:
+                return False, str(e)[:200]
+
+    return await asyncio.to_thread(_run)
+
+
+async def _music_reconnaitre(chemin: str) -> tuple[dict | None, str | None]:
+    """Reconnaît le morceau via Shazam (réseau uniquement, pas de modèle local)."""
+    try:
+        from shazamio import Shazam
+    except ImportError:
+        return None, (
+            "shazamio n'est pas installé. Ajoute `shazamio` dans requirements.txt "
+            "puis redeploie (`pip install shazamio`)."
+        )
+    try:
+        shazam = Shazam()
+        # API shazamio : recognize (versions récentes) ou recognize_song (anciennes)
+        if hasattr(shazam, "recognize"):
+            data = await asyncio.wait_for(shazam.recognize(chemin), timeout=MUSIC_TIMEOUT_SEC)
+        else:
+            data = await asyncio.wait_for(shazam.recognize_song(chemin), timeout=MUSIC_TIMEOUT_SEC)
+        return data, None
+    except asyncio.TimeoutError:
+        return None, "Délai dépassé (Shazam trop lent)."
+    except Exception as e:
+        msg = str(e)[:300]
+        if "404" in msg or "not found" in msg.lower():
+            return None, "not_found"
+        return None, msg
+
+
+def _music_parse_resultat(data: dict) -> dict | None:
+    """Extrait titre / artiste / album / cover / urls depuis la réponse Shazam."""
+    if not data or not isinstance(data, dict):
+        return None
+    track = data.get("track") or data
+    if not isinstance(track, dict):
+        return None
+    title = track.get("title") or track.get("heading", {}).get("title")
+    artist = (
+        track.get("subtitle")
+        or track.get("heading", {}).get("subtitle")
+        or track.get("artist")
+    )
+    if not title and not artist:
+        return None
+
+    album = None
+    sections = track.get("sections") or []
+    for sec in sections:
+        if sec.get("type") == "SONG" or sec.get("tabname") == "Song":
+            for meta in sec.get("metadata") or []:
+                if str(meta.get("title", "")).lower() in ("album", "albums"):
+                    album = meta.get("text")
+                    break
+        if album:
+            break
+    if not album:
+        album = (track.get("sections") or [{}])[0].get("metadata", [{}])[0].get("text") if track.get("sections") else None
+
+    cover = None
+    images = track.get("images") or {}
+    if isinstance(images, dict):
+        cover = images.get("coverarthq") or images.get("coverart") or images.get("background")
+
+    urls = track.get("share", {}) if isinstance(track.get("share"), dict) else {}
+    share_url = urls.get("href") or track.get("url")
+    apple = None
+    hub = track.get("hub") or {}
+    for opt in hub.get("options") or []:
+        if str(opt.get("caption", "")).lower().find("apple") >= 0 or opt.get("providername") == "applemusic":
+            actions = opt.get("actions") or hub.get("actions") or []
+            for a in actions:
+                if a.get("uri") or a.get("url"):
+                    apple = a.get("uri") or a.get("url")
+                    break
+        if apple:
+            break
+    if not apple:
+        for a in (hub.get("actions") or []):
+            u = a.get("uri") or a.get("url")
+            if u and "apple" in str(u).lower():
+                apple = u
+                break
+
+    return {
+        "title": title or "Unknown",
+        "artist": artist or "Unknown",
+        "album": album,
+        "cover": cover,
+        "url": share_url,
+        "apple": apple,
+    }
+
+
+MUSIC_EXTENSIONS_OK = (
+    ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".wma",
+    ".mp4", ".webm", ".mov", ".mkv", ".avi",
+)
+
+
+def _attachment_audio_video(att: discord.Attachment) -> bool:
+    nom = (att.filename or "").lower()
+    ct = (att.content_type or "").lower()
+    type_ok = ct.startswith("audio/") or ct.startswith("video/")
+    ext_ok = any(nom.endswith(ext) for ext in MUSIC_EXTENSIONS_OK)
+    return type_ok or ext_ok
+
+
+def _songfinder_embed(info: dict, requester_name: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎵 Track found",
+        color=discord.Color.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Title", value=info["title"], inline=True)
+    embed.add_field(name="Artist", value=info["artist"], inline=True)
+    if info.get("album"):
+        embed.add_field(name="Album", value=info["album"], inline=True)
+    if info.get("cover"):
+        embed.set_thumbnail(url=info["cover"])
+    liens = []
+    if info.get("url"):
+        liens.append(f"[Shazam]({info['url']})")
+    if info.get("apple"):
+        liens.append(f"[Apple Music]({info['apple']})")
+    if liens:
+        embed.add_field(name="Links", value=" • ".join(liens), inline=False)
+    embed.set_footer(text=f"Requested by {requester_name}")
+    return embed
+
+
+async def _songfinder_depuis_attachment(attachment: discord.Attachment, dossier_id, requester_name: str):
+    """Télécharge la pièce jointe, reconnaît le morceau, retourne (embed|None, erreur|None)."""
+    nom = (attachment.filename or "audio").lower()
+    if attachment.size and attachment.size > MUSIC_MAX_OCTETS:
+        return None, (
+            f"❌ File too large (**{attachment.size // (1024 * 1024)} MB**). "
+            f"Maximum is **{MUSIC_MAX_OCTETS // (1024 * 1024)} MB** "
+            f"(send a short clip of the song)."
+        )
+
+    dossier = os.path.join("/tmp", f"music_{dossier_id}")
+    src = os.path.join(dossier, "input" + (os.path.splitext(nom)[1] or ".bin"))
+    sample = os.path.join(dossier, "sample.mp3")
+    try:
+        os.makedirs(dossier, exist_ok=True)
+        await attachment.save(src)
+
+        ok, err = await _music_extraire_echantillon(src, sample)
+        if not ok:
+            return None, f"❌ Could not process the file: {err}"
+
+        data, err = await _music_reconnaitre(sample if os.path.exists(sample) else src)
+        if err == "not_found" or (data is None and not err):
+            return None, "🔍 No match found. Try a clearer / longer excerpt (with less noise)."
+        if err and data is None:
+            return None, f"❌ Recognition failed: {err}"
+
+        info = _music_parse_resultat(data or {})
+        if not info:
+            return None, "🔍 No match found. Try another excerpt of the track."
+
+        return _songfinder_embed(info, requester_name), None
+    except Exception as e:
+        return None, f"❌ Error: {str(e)[:300]}"
+    finally:
+        try:
+            if os.path.isdir(dossier):
+                for nom_f in os.listdir(dossier):
+                    try:
+                        os.remove(os.path.join(dossier, nom_f))
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(dossier)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+@tree.command(
+    name="songfinder",
+    description="Recognize a song from an audio/video file (Shazam, low RAM)",
+)
+@app_commands.guild_only()
+@app_commands.describe(fichier="Audio or video file containing the song (max 8 MB)")
+async def songfinder_cmd(interaction: discord.Interaction, fichier: discord.Attachment):
+    """Recognize a song from a file. Designed to stay light on RAM on Render."""
+    if not _attachment_audio_video(fichier):
+        await interaction.response.send_message(
+            "❌ Please send an **audio** or **video** file "
+            "(mp3, wav, ogg, m4a, mp4, webm…).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    embed, err = await _songfinder_depuis_attachment(
+        fichier, interaction.id, interaction.user.display_name
+    )
+    if err:
+        await interaction.followup.send(err)
+        return
+    await interaction.followup.send(embed=embed)
+
+
+async def traiter_songfinder_message(message: discord.Message):
+    """!songfinder en réponse à un message avec un fichier audio/vidéo (comme !dl)."""
+    attachment = None
+
+    # 1) Pièce jointe sur le message !songfinder lui-même
+    for att in message.attachments:
+        if _attachment_audio_video(att):
+            attachment = att
+            break
+
+    # 2) Sinon, message auquel on répond
+    if attachment is None and message.reference:
+        ref = message.reference
+        cible = ref.resolved
+        if cible is None and ref.message_id:
+            try:
+                cible = await message.channel.fetch_message(ref.message_id)
+            except (discord.NotFound, discord.HTTPException):
+                cible = None
+        if cible is not None:
+            for att in getattr(cible, "attachments", []) or []:
+                if _attachment_audio_video(att):
+                    attachment = att
+                    break
+
+    if attachment is None:
+        await message.reply(
+            "Reply to a message with an **audio/video** file using `!songfinder`, "
+            "attach a file with `!songfinder`, or use `/songfinder`.\n"
+            f"Max size: **{MUSIC_MAX_OCTETS // (1024 * 1024)} MB**.",
+            mention_author=False,
+        )
+        return
+
+    statut = await message.reply("🔍 Searching for the track...", mention_author=False)
+    embed, err = await _songfinder_depuis_attachment(
+        attachment, message.id, message.author.display_name
+    )
+    try:
+        if err:
+            await statut.edit(content=err)
+        else:
+            await statut.edit(content=None, embed=embed)
+    except discord.HTTPException:
+        if err:
+            await message.channel.send(err)
+        elif embed:
+            await message.channel.send(embed=embed)
+
 # ---------- FILTRE ----------
 @client.event
 async def on_message(message):
@@ -1702,6 +3498,11 @@ async def on_message(message):
             print(f"[ERREUR] Timeout impossible : {e}")
         return
 
+    # Anti mur de texte
+    if not est_protege and est_mur_de_texte(contenus_a_analyser):
+        await sanctionner_mur_de_texte(message, membre)
+        return
+
     # Anti-spam
     if not est_protege:
         a_supprimer = enregistrer_message(message)
@@ -1738,10 +3539,29 @@ async def on_message(message):
     # Niveaux : le message est passé par tous les filtres, il rapporte de l'XP
     await gagner_xp(message, membre)
 
-    if message.content == "!ping":
-        await message.channel.send("Pong !")
+    # /fun : réponse personnalisée du bot quand un membre ciblé écrit
+    await fun_repondre(message, membre)
 
-        
+    contenu_cmd = (message.content or "").strip()
+    if contenu_cmd == "!ping":
+        await message.channel.send("Pong !")
+        return
+
+    # !dl — reply to a message with a link, or !dl <url>
+    if contenu_cmd == "!dl" or contenu_cmd.startswith("!dl "):
+        await traiter_dl_message(message)
+        return
+
+    # !songfinder — reply to a message with an audio/video file (or attach one)
+    if (
+        contenu_cmd in ("!songfinder", "!song finder")
+        or contenu_cmd.startswith("!songfinder ")
+        or contenu_cmd.startswith("!song finder ")
+    ):
+        await traiter_songfinder_message(message)
+        return
+
+
 
 # ---------- FICHIERS BLOQUÉS (anti-reupload) ----------
 FICHIER_BLOCKED = "blocked_files.json"
@@ -2854,6 +4674,629 @@ async def dsstatgraph(interaction: discord.Interaction, graph: str = "flux", day
     await envoyer_graphique(interaction, days, graph)
 
 
+# ---------- ANTI-NUKE (protection contre destruction du serveur) ----------
+# Détecte :
+#   - suppressions massives de salons
+#   - attribution massive de la permission Administrateur
+# Actions :
+#   - bannit l'auteur principal
+#   - retire les rôles admin aux personnes qui les ont reçus récemment
+#   - restaure au mieux les salons supprimés (snapshot)
+#
+# Nécessite : View Audit Log, Manage Channels, Manage Roles, Ban Members
+# Le rôle du bot DOIT être au-dessus des rôles qu'il doit sanctionner.
+
+FICHIER_ANTINUKE = "antinuke_config.json"
+FICHIER_SNAPSHOTS = "antinuke_snapshots.json"
+
+# Seuils par défaut (par acteur)
+ANTINUKE_CHANNEL_DELETE_MAX = 3          # 3+ suppressions...
+ANTINUKE_CHANNEL_DELETE_WINDOW = 20      # ...en moins de 20 secondes
+ANTINUKE_ADMIN_GRANT_MAX = 2             # 2+ grants d'Administrator...
+ANTINUKE_ADMIN_GRANT_WINDOW = 60         # ...en moins de 60 secondes
+ANTINUKE_RESTORE_LIMIT = 40              # max de salons restaurés d'un coup
+
+# Permissions considérées comme dangereuses (en plus d'Administrator)
+PERMS_DANGEREUSES = (
+    "administrator",
+    "manage_guild",
+    "manage_roles",
+    "manage_channels",
+    "ban_members",
+    "kick_members",
+    "manage_webhooks",
+)
+
+
+def charger_antinuke():
+    try:
+        data = storage.charger(FICHIER_ANTINUKE)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def sauver_antinuke(data):
+    storage.sauver(FICHIER_ANTINUKE, data)
+
+
+def charger_snapshots():
+    try:
+        data = storage.charger(FICHIER_SNAPSHOTS)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def sauver_snapshots(data):
+    storage.sauver(FICHIER_SNAPSHOTS, data)
+
+
+ANTINUKE = charger_antinuke()          # guild_id -> config
+SNAPSHOTS = charger_snapshots()        # guild_id -> {channel_id: info}
+
+# Compteurs en mémoire : (guild_id, user_id) -> deque[timestamps]
+_antinuke_channel_deletes = defaultdict(deque)
+_antinuke_admin_grants = defaultdict(deque)   # grants d'admin (role ou member)
+# Qui a reçu un admin récemment : guild_id -> list[{user_id, role_id, by, ts}]
+_antinuke_recent_admin_receivers = defaultdict(list)
+# Protections anti-doublon de sanction
+_antinuke_punished = set()             # (guild_id, user_id) récemment sanctionnés
+
+
+def antinuke_actif(guild_id: int) -> bool:
+    cfg = ANTINUKE.get(str(guild_id), {})
+    return bool(cfg.get("enabled", False))
+
+
+def antinuke_whitelist(guild: discord.Guild, user_id: int) -> bool:
+    """Owner + liste blanche configurée + le bot lui-même."""
+    if user_id == guild.owner_id:
+        return True
+    if client.user and user_id == client.user.id:
+        return True
+    cfg = ANTINUKE.get(str(guild.id), {})
+    return user_id in set(cfg.get("whitelist", []))
+
+
+def _serialiser_overwrites(channel: discord.abc.GuildChannel) -> list:
+    out = []
+    for target, ow in channel.overwrites.items():
+        try:
+            allow, deny = ow.pair()
+            out.append({
+                "id": target.id,
+                "type": "role" if isinstance(target, discord.Role) else "member",
+                "allow": allow.value,
+                "deny": deny.value,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def snapshot_channel(channel: discord.abc.GuildChannel) -> dict:
+    """Capture l'essentiel d'un salon pour pouvoir le recréer."""
+    info = {
+        "id": channel.id,
+        "name": channel.name,
+        "type": int(channel.type),
+        "position": channel.position,
+        "category_id": channel.category_id,
+        "overwrites": _serialiser_overwrites(channel),
+    }
+    if isinstance(channel, discord.TextChannel):
+        info["topic"] = channel.topic
+        info["nsfw"] = channel.nsfw
+        info["slowmode_delay"] = channel.slowmode_delay
+    elif isinstance(channel, discord.VoiceChannel):
+        info["bitrate"] = channel.bitrate
+        info["user_limit"] = channel.user_limit
+        info["nsfw"] = getattr(channel, "nsfw", False)
+    elif isinstance(channel, discord.CategoryChannel):
+        pass
+    elif isinstance(channel, discord.ForumChannel):
+        info["topic"] = getattr(channel, "topic", None)
+        info["nsfw"] = getattr(channel, "nsfw", False)
+    return info
+
+
+def prendre_snapshot_guild(guild: discord.Guild):
+    """Met à jour le snapshot de tous les salons du serveur."""
+    data = {}
+    for ch in guild.channels:
+        try:
+            data[str(ch.id)] = snapshot_channel(ch)
+        except Exception as e:
+            print(f"[ANTINUKE] Snapshot impossible pour {ch}: {e}")
+    SNAPSHOTS[str(guild.id)] = data
+    try:
+        sauver_snapshots(SNAPSHOTS)
+    except Exception as e:
+        print(f"[ANTINUKE] Sauvegarde snapshot impossible : {e}")
+
+
+async def restaurer_salon(guild: discord.Guild, info: dict):
+    """Recrée un salon à partir d'un snapshot. Retourne le nouveau channel ou None."""
+    try:
+        overwrites = {}
+        for ow in info.get("overwrites", []):
+            target = None
+            if ow.get("type") == "role":
+                target = guild.get_role(ow["id"])
+            else:
+                target = guild.get_member(ow["id"])
+            if target is None:
+                continue
+            overwrites[target] = discord.PermissionOverwrite.from_pair(
+                discord.Permissions(ow.get("allow", 0)),
+                discord.Permissions(ow.get("deny", 0)),
+            )
+
+        category = guild.get_channel(info["category_id"]) if info.get("category_id") else None
+        kwargs = {
+            "name": info.get("name", "restored-channel")[:100],
+            "overwrites": overwrites,
+            "reason": "Anti-nuke: channel restore",
+        }
+        if category and isinstance(category, discord.CategoryChannel):
+            kwargs["category"] = category
+
+        t = info.get("type", 0)
+        if t == int(discord.ChannelType.category):
+            ch = await guild.create_category(**kwargs)
+        elif t == int(discord.ChannelType.voice):
+            kwargs["bitrate"] = info.get("bitrate", 64000)
+            kwargs["user_limit"] = info.get("user_limit", 0)
+            ch = await guild.create_voice_channel(**kwargs)
+        elif t == int(discord.ChannelType.stage_voice):
+            ch = await guild.create_stage_channel(**kwargs)
+        elif t == int(discord.ChannelType.forum):
+            ch = await guild.create_forum_channel(**kwargs)
+        else:
+            # text / news / etc.
+            kwargs["topic"] = info.get("topic")
+            kwargs["nsfw"] = info.get("nsfw", False)
+            kwargs["slowmode_delay"] = info.get("slowmode_delay", 0)
+            ch = await guild.create_text_channel(**kwargs)
+
+        # Position (best-effort)
+        try:
+            await ch.edit(position=info.get("position", 0))
+        except Exception:
+            pass
+        return ch
+    except discord.Forbidden:
+        print(f"[ANTINUKE] Pas la permission de recréer le salon {info.get('name')}")
+    except Exception as e:
+        print(f"[ANTINUKE] Erreur restauration salon {info.get('name')}: {e}")
+    return None
+
+
+def _nettoyer_deque(q: deque, fenetre: float):
+    maintenant = time.time()
+    while q and maintenant - q[0] > fenetre:
+        q.popleft()
+
+
+async def antinuke_sanctionner(guild: discord.Guild, acteur: discord.Member | discord.User, raison: str, channels_a_restaurer: list | None = None):
+    """Bannit l'acteur, retire les admins récemment donnés, restaure les salons."""
+    cle = (guild.id, acteur.id)
+    if cle in _antinuke_punished:
+        return
+    _antinuke_punished.add(cle)
+    # Nettoyage après 2 min
+    asyncio.get_event_loop().call_later(120, lambda: _antinuke_punished.discard(cle))
+
+    membre = guild.get_member(acteur.id)
+
+    # 1. Retirer tous les rôles (sauf @everyone) si possible, puis ban
+    if membre is not None and not antinuke_whitelist(guild, membre.id):
+        try:
+            roles_a_retirer = [r for r in membre.roles if r != guild.default_role and r < guild.me.top_role]
+            if roles_a_retirer:
+                await membre.remove_roles(*roles_a_retirer, reason=f"Anti-nuke: {raison}")
+        except Exception as e:
+            print(f"[ANTINUKE] Impossible de retirer les rôles de {acteur}: {e}")
+
+        try:
+            await guild.ban(
+                acteur,
+                reason=f"Anti-nuke: {raison}",
+                delete_message_seconds=0,
+            )
+            sanction_cmd.add(cle)  # évite le message auto de départ
+        except discord.Forbidden:
+            print(f"[ANTINUKE] Impossible de bannir {acteur} (hiérarchie / permission)")
+        except Exception as e:
+            print(f"[ANTINUKE] Erreur ban {acteur}: {e}")
+
+    # 2. Retirer Administrator aux personnes qui l'ont reçu récemment (via cet acteur ou dans la fenêtre)
+    maintenant = time.time()
+    recent = _antinuke_recent_admin_receivers.get(guild.id, [])
+    restants = []
+    for rec in recent:
+        if maintenant - rec["ts"] > 300:  # 5 min
+            continue
+        # On retire si c'est le même acteur ou si on est en mode "destruction globale"
+        if rec.get("by") == acteur.id or True:
+            membre_cible = guild.get_member(rec["user_id"])
+            role = guild.get_role(rec["role_id"])
+            if membre_cible and role and role in membre_cible.roles:
+                try:
+                    if role.permissions.administrator or any(
+                        getattr(role.permissions, p, False) for p in PERMS_DANGEREUSES
+                    ):
+                        await membre_cible.remove_roles(role, reason="Anti-nuke: revoke dangerous role")
+                        print(f"[ANTINUKE] Rôle {role.name} retiré à {membre_cible}")
+                except Exception as e:
+                    print(f"[ANTINUKE] Impossible de retirer le rôle à {membre_cible}: {e}")
+        else:
+            restants.append(rec)
+    _antinuke_recent_admin_receivers[guild.id] = restants
+
+    # 3. Restaurer les salons
+    restaures = []
+    if channels_a_restaurer:
+        for info in channels_a_restaurer[:ANTINUKE_RESTORE_LIMIT]:
+            ch = await restaurer_salon(guild, info)
+            if ch:
+                restaures.append(ch.name)
+
+    # 4. Log
+    desc = (
+        f"**Actor:** {acteur.mention} (`{acteur.id}`)\n"
+        f"**Reason:** {raison}\n"
+        f"**Action:** Roles stripped + ban\n"
+        f"**Channels restored:** {len(restaures)}"
+    )
+    if restaures:
+        desc += "\n• " + ", ".join(f"`#{n}`" for n in restaures[:15])
+        if len(restaures) > 15:
+            desc += f" … (+{len(restaures) - 15})"
+    await envoyer_log(guild, "🛡️ ANTI-NUKE TRIGGERED", desc, discord.Color.dark_red())
+
+    # Annonce dans le salon d'annonce anti-raid si dispo
+    announce = guild.get_channel(RAID_ANNOUNCE_CHANNEL_ID)
+    if announce is None:
+        try:
+            announce = await guild.fetch_channel(RAID_ANNOUNCE_CHANNEL_ID)
+        except Exception:
+            announce = None
+    if announce is not None:
+        try:
+            await announce.send(
+                f"🛡️ **Anti-nuke activated** — {acteur.mention} has been banned for destructive actions.\n"
+                f"Channels restored: **{len(restaures)}**.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+
+
+async def antinuke_traiter_channel_delete(entry: discord.AuditLogEntry):
+    """Appelé quand un salon est supprimé."""
+    guild = entry.guild
+    if guild is None or not antinuke_actif(guild.id):
+        return
+    acteur = entry.user
+    if acteur is None or antinuke_whitelist(guild, acteur.id):
+        return
+
+    # Enregistre la suppression
+    cle = (guild.id, acteur.id)
+    q = _antinuke_channel_deletes[cle]
+    maintenant = time.time()
+    q.append(maintenant)
+    _nettoyer_deque(q, ANTINUKE_CHANNEL_DELETE_WINDOW)
+
+    # Snapshot du salon qui vient d'être supprimé (si on l'avait)
+    snap = SNAPSHOTS.get(str(guild.id), {}).get(str(entry.target.id) if entry.target else "")
+    channels_a_restaurer = []
+    if snap:
+        channels_a_restaurer.append(snap)
+
+    if len(q) >= ANTINUKE_CHANNEL_DELETE_MAX:
+        # Récupère tous les snapshots des salons récemment supprimés par cet acteur
+        # (on se contente du snapshot global actuel + celui-ci)
+        # Pour être plus précis on pourrait stocker une file des derniers deletes.
+        tous = list(SNAPSHOTS.get(str(guild.id), {}).values())
+        # On ne restaure que ceux qui n'existent plus
+        existants = {c.id for c in guild.channels}
+        a_restorer = [s for s in tous if s.get("id") not in existants]
+        if snap and snap not in a_restorer:
+            a_restorer.append(snap)
+        await antinuke_sanctionner(
+            guild,
+            acteur,
+            f"Mass channel deletion ({len(q)} in {ANTINUKE_CHANNEL_DELETE_WINDOW}s)",
+            channels_a_restaurer=a_restorer,
+        )
+        q.clear()
+
+
+async def antinuke_traiter_role_update(entry: discord.AuditLogEntry):
+    """Détecte l'ajout de permissions dangereuses sur un rôle."""
+    guild = entry.guild
+    if guild is None or not antinuke_actif(guild.id):
+        return
+    acteur = entry.user
+    if acteur is None or antinuke_whitelist(guild, acteur.id):
+        return
+
+    # entry.changes contient les changements
+    dangereux = False
+    for change in (entry.changes or []):
+        attr = getattr(change, "key", None) or getattr(change, "attribute", None)
+        if attr in PERMS_DANGEREUSES:
+            avant = getattr(change, "before", None)
+            apres = getattr(change, "after", None)
+            if apres is True and avant is not True:
+                dangereux = True
+                break
+        # Parfois Discord envoie permissions comme un entier
+        if attr == "permissions":
+            try:
+                avant_p = discord.Permissions(getattr(change, "before", 0) or 0)
+                apres_p = discord.Permissions(getattr(change, "after", 0) or 0)
+                for p in PERMS_DANGEREUSES:
+                    if getattr(apres_p, p, False) and not getattr(avant_p, p, False):
+                        dangereux = True
+                        break
+            except Exception:
+                pass
+
+    if not dangereux:
+        return
+
+    cle = (guild.id, acteur.id)
+    q = _antinuke_admin_grants[cle]
+    q.append(time.time())
+    _nettoyer_deque(q, ANTINUKE_ADMIN_GRANT_WINDOW)
+
+    # On enregistre aussi le rôle modifié pour pouvoir le "nettoyer" plus tard
+    role = entry.target
+    if isinstance(role, discord.Role):
+        # On note les membres qui ont ce rôle (ils reçoivent potentiellement l'admin)
+        for m in role.members:
+            _antinuke_recent_admin_receivers[guild.id].append({
+                "user_id": m.id,
+                "role_id": role.id,
+                "by": acteur.id,
+                "ts": time.time(),
+            })
+
+    if len(q) >= ANTINUKE_ADMIN_GRANT_MAX:
+        await antinuke_sanctionner(
+            guild,
+            acteur,
+            f"Mass dangerous permission grant ({len(q)} in {ANTINUKE_ADMIN_GRANT_WINDOW}s)",
+        )
+        q.clear()
+
+
+async def antinuke_traiter_member_role_update(entry: discord.AuditLogEntry):
+    """Quelqu'un a reçu / perdu un rôle. On regarde si le rôle a Administrator."""
+    guild = entry.guild
+    if guild is None or not antinuke_actif(guild.id):
+        return
+    acteur = entry.user
+    if acteur is None or antinuke_whitelist(guild, acteur.id):
+        return
+
+    # changes: role add / remove
+    for change in (entry.changes or []):
+        # discord.py : change.key peut être "$add" ou "roles"
+        key = getattr(change, "key", None)
+        after = getattr(change, "after", None)
+        if key in ("$add", "roles") and after:
+            roles_ajoutes = after if isinstance(after, list) else [after]
+            for r in roles_ajoutes:
+                role = r if isinstance(r, discord.Role) else guild.get_role(getattr(r, "id", r))
+                if role is None:
+                    continue
+                if role.permissions.administrator or any(
+                    getattr(role.permissions, p, False) for p in PERMS_DANGEREUSES
+                ):
+                    cible = entry.target
+                    if cible:
+                        _antinuke_recent_admin_receivers[guild.id].append({
+                            "user_id": cible.id,
+                            "role_id": role.id,
+                            "by": acteur.id,
+                            "ts": time.time(),
+                        })
+                    cle = (guild.id, acteur.id)
+                    q = _antinuke_admin_grants[cle]
+                    q.append(time.time())
+                    _nettoyer_deque(q, ANTINUKE_ADMIN_GRANT_WINDOW)
+                    if len(q) >= ANTINUKE_ADMIN_GRANT_MAX:
+                        await antinuke_sanctionner(
+                            guild,
+                            acteur,
+                            f"Mass admin role assignment ({len(q)} in {ANTINUKE_ADMIN_GRANT_WINDOW}s)",
+                        )
+                        q.clear()
+
+
+@tasks.loop(minutes=10)
+async def boucle_snapshots_antinuke():
+    """Met à jour régulièrement les snapshots des salons."""
+    for guild in client.guilds:
+        if antinuke_actif(guild.id):
+            try:
+                prendre_snapshot_guild(guild)
+            except Exception as e:
+                print(f"[ANTINUKE] Snapshot périodique échoué sur {guild.name}: {e}")
+
+
+@boucle_snapshots_antinuke.before_loop
+async def _avant_snapshots_antinuke():
+    await client.wait_until_ready()
+
+
+@tree.command(
+    name="setupantinuke",
+    description="Enable / configure anti-nuke protection (mass channel delete + admin grants)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    enabled="Turn anti-nuke on or off",
+)
+async def setupantinuke(interaction: discord.Interaction, enabled: bool = True):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    # Seul le owner (ou un admin whitelisté) devrait pouvoir activer, mais on reste souple
+    guild = interaction.guild
+    ANTINUKE[str(guild.id)] = {
+        "enabled": enabled,
+        "whitelist": ANTINUKE.get(str(guild.id), {}).get("whitelist", []),
+        "configured_by": interaction.user.id,
+        "configured_at": discord.utils.utcnow().isoformat(),
+    }
+    sauver_antinuke(ANTINUKE)
+
+    if enabled:
+        prendre_snapshot_guild(guild)
+        await interaction.response.send_message(
+            "✅ **Anti-nuke enabled.**\n\n"
+            f"• Channel deletes: **{ANTINUKE_CHANNEL_DELETE_MAX}+** in {ANTINUKE_CHANNEL_DELETE_WINDOW}s → ban + restore\n"
+            f"• Admin / dangerous permission grants: **{ANTINUKE_ADMIN_GRANT_MAX}+** in {ANTINUKE_ADMIN_GRANT_WINDOW}s → ban + revoke\n\n"
+            "⚠️ Put the bot role **above** every role it may need to strip or ban.\n"
+            "Use `/antinuke_whitelist` to protect trusted admins.",
+            ephemeral=True,
+        )
+        await envoyer_log(
+            guild,
+            "🛡️ Anti-nuke enabled",
+            f"Configured by {interaction.user.mention}",
+            discord.Color.green(),
+        )
+    else:
+        await interaction.response.send_message("❌ Anti-nuke disabled.", ephemeral=True)
+
+
+@tree.command(
+    name="antinuke_whitelist",
+    description="Add or remove a trusted user from the anti-nuke whitelist",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    user="User to add or remove",
+    action="add or remove",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+])
+async def antinuke_whitelist_cmd(
+    interaction: discord.Interaction,
+    user: discord.User,
+    action: str,
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    if interaction.user.id != interaction.guild.owner_id and not antinuke_whitelist(interaction.guild, interaction.user.id):
+        # Seul le owner ou quelqu'un déjà whitelisté peut modifier
+        await interaction.response.send_message(
+            "Only the server owner (or an already whitelisted user) can edit the whitelist.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = ANTINUKE.setdefault(str(interaction.guild.id), {"enabled": False, "whitelist": []})
+    wl = list(cfg.get("whitelist", []))
+    if action == "add":
+        if user.id not in wl:
+            wl.append(user.id)
+        msg = f"✅ {user.mention} added to the anti-nuke whitelist."
+    else:
+        wl = [uid for uid in wl if uid != user.id]
+        msg = f"✅ {user.mention} removed from the anti-nuke whitelist."
+    cfg["whitelist"] = wl
+    ANTINUKE[str(interaction.guild.id)] = cfg
+    sauver_antinuke(ANTINUKE)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(
+    name="antinuke_status",
+    description="Show anti-nuke status and current whitelist",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def antinuke_status(interaction: discord.Interaction):
+    cfg = ANTINUKE.get(str(interaction.guild.id), {})
+    enabled = cfg.get("enabled", False)
+    wl = cfg.get("whitelist", [])
+    snaps = len(SNAPSHOTS.get(str(interaction.guild.id), {}))
+    texte = (
+        f"**Anti-nuke:** {'🟢 ON' if enabled else '🔴 OFF'}\n"
+        f"**Channel delete threshold:** {ANTINUKE_CHANNEL_DELETE_MAX} / {ANTINUKE_CHANNEL_DELETE_WINDOW}s\n"
+        f"**Admin grant threshold:** {ANTINUKE_ADMIN_GRANT_MAX} / {ANTINUKE_ADMIN_GRANT_WINDOW}s\n"
+        f"**Channels in snapshot:** {snaps}\n"
+        f"**Whitelist:** {', '.join(f'<@{uid}>' for uid in wl) if wl else '_empty (owner always protected)_'}"
+    )
+    await interaction.response.send_message(texte, ephemeral=True)
+
+
+@tree.command(
+    name="antinuke_snapshot",
+    description="Force an immediate channel snapshot (for restore)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def antinuke_snapshot(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    prendre_snapshot_guild(interaction.guild)
+    n = len(SNAPSHOTS.get(str(interaction.guild.id), {}))
+    await interaction.followup.send(f"✅ Snapshot taken: **{n}** channels stored.", ephemeral=True)
+
+
+
+
+
+@client.event
+async def on_guild_channel_create(channel):
+    if not isinstance(channel, discord.abc.GuildChannel):
+        return
+    guild = channel.guild
+    if not antinuke_actif(guild.id):
+        return
+    try:
+        SNAPSHOTS.setdefault(str(guild.id), {})[str(channel.id)] = snapshot_channel(channel)
+        sauver_snapshots(SNAPSHOTS)
+    except Exception as e:
+        print(f"[ANTINUKE] Snapshot create échoué : {e}")
+
+
+@client.event
+async def on_guild_channel_update(before, after):
+    if not isinstance(after, discord.abc.GuildChannel):
+        return
+    guild = after.guild
+    if not antinuke_actif(guild.id):
+        return
+    try:
+        SNAPSHOTS.setdefault(str(guild.id), {})[str(after.id)] = snapshot_channel(after)
+        sauver_snapshots(SNAPSHOTS)
+    except Exception as e:
+        print(f"[ANTINUKE] Snapshot update échoué : {e}")
+
+
+@client.event
+async def on_guild_channel_delete(channel):
+    # Snapshot volontairement conservé pour pouvoir restaurer
+    pass
+
+
 # ---------- TICKETS ----------
 FICHIER_TICKETS = "tickets_config.json"
 TICKET_CATEGORY_ID = 1492234570093826209  # catégorie des tickets mise à jour[cite: 2]
@@ -3289,6 +5732,158 @@ SALONS_VOCAUX = {}
 DEMANDES_VOCAL = {}
 
 
+def _est_salle_attente(channel: discord.abc.GuildChannel) -> bool:
+    """True si le salon suit la convention de nom des salles d'attente."""
+    return isinstance(channel, discord.VoiceChannel) and channel.name.lower().startswith("waiting room of ")
+
+
+def _est_salon_prive_nom(channel: discord.abc.GuildChannel) -> bool:
+    """True si le salon suit la convention de nom des vocaux privés (...'s vc)."""
+    return isinstance(channel, discord.VoiceChannel) and channel.name.endswith("'s vc")
+
+
+def _owner_depuis_overwrites(channel: discord.VoiceChannel):
+    """Retrouve le propriétaire via les permissions du salon (membre avec accès dédié)."""
+    bot_id = client.user.id if client.user else None
+    candidats = []
+    for target, ow in channel.overwrites.items():
+        if not isinstance(target, discord.Member):
+            continue
+        if bot_id is not None and target.id == bot_id:
+            continue
+        if ow.view_channel is True and ow.connect is True:
+            candidats.append(target.id)
+    if len(candidats) == 1:
+        return candidats[0]
+    if candidats:
+        return candidats[0]
+    return None
+
+
+def _trouver_paire_vocale(category: discord.CategoryChannel, channel: discord.VoiceChannel):
+    """À partir d'un salon (privé ou attente), retrouve (room, waiting, owner_id) dans la catégorie."""
+    if _est_salle_attente(channel):
+        suffix = channel.name[len("waiting room of "):].strip()
+        room = None
+        for ch in category.voice_channels:
+            if ch.id == channel.id:
+                continue
+            if ch.name == f"{suffix}'s vc":
+                room = ch
+                break
+        waiting = channel
+    elif _est_salon_prive_nom(channel):
+        base = channel.name[:-len("'s vc")].strip()
+        waiting = None
+        for ch in category.voice_channels:
+            if ch.id == channel.id:
+                continue
+            if ch.name == f"waiting room of {base}":
+                waiting = ch
+                break
+        room = channel
+    else:
+        return None
+
+    if room is None:
+        return None
+
+    owner_id = _owner_depuis_overwrites(room)
+    if owner_id is None and room.members:
+        for m in room.members:
+            if not m.bot:
+                owner_id = m.id
+                break
+    return room, waiting, owner_id
+
+
+def _enregistrer_paire_vocale(guild_id: int, room: discord.VoiceChannel, waiting, owner_id: int):
+    SALONS_VOCAUX[room.id] = {
+        "owner_id": owner_id,
+        "waiting_id": waiting.id if waiting else None,
+        "guild_id": guild_id,
+        "waiting": False,
+    }
+    if waiting is not None:
+        SALONS_VOCAUX[waiting.id] = {
+            "owner_id": owner_id,
+            "room_id": room.id,
+            "waiting": True,
+            "guild_id": guild_id,
+        }
+
+
+async def reconstruire_vocaux_guild(guild: discord.Guild):
+    """Au démarrage : réassocie les vocaux encore occupés et supprime les vocaux privés vides
+    (et leurs salles d'attente) laissés orphelins après un redémarrage / mise à jour."""
+    config = VOCAL_CONFIG.get(str(guild.id))
+    if not config:
+        return
+
+    category = guild.get_channel(config.get("category_id"))
+    if category is None or not isinstance(category, discord.CategoryChannel):
+        print(f"[VOCAL] Catégorie introuvable sur {guild.name} — reconstruction ignorée.")
+        return
+
+    trigger_id = config.get("trigger_id")
+    vus = set()
+    supprimes = 0
+    restaures = 0
+
+    for channel in list(category.voice_channels):
+        if channel.id == trigger_id or channel.id in vus:
+            continue
+        if not (_est_salle_attente(channel) or _est_salon_prive_nom(channel)):
+            continue
+
+        paire = _trouver_paire_vocale(category, channel)
+        if paire is None:
+            if _est_salle_attente(channel) and len(channel.members) == 0:
+                try:
+                    await channel.delete(reason="Orphan waiting room cleanup on startup")
+                    supprimes += 1
+                except Exception as e:
+                    print(f"[VOCAL] Suppression orphelin impossible ({channel.name}): {e}")
+            continue
+
+        room, waiting, owner_id = paire
+        vus.add(room.id)
+        if waiting is not None:
+            vus.add(waiting.id)
+
+        if len(room.members) == 0:
+            for ch in (room, waiting):
+                if ch is None:
+                    continue
+                try:
+                    await ch.delete(reason="Empty private VC cleanup on startup")
+                    supprimes += 1
+                except Exception as e:
+                    print(f"[VOCAL] Suppression vide impossible ({ch.name}): {e}")
+            continue
+
+        if owner_id is None:
+            print(f"[VOCAL] Impossible de retrouver le propriétaire de {room.name}, ignoré.")
+            continue
+        _enregistrer_paire_vocale(guild.id, room, waiting, owner_id)
+        restaures += 1
+
+    if supprimes or restaures:
+        print(
+            f"[VOCAL] {guild.name}: {restaures} salon(s) privé(s) restauré(s), "
+            f"{supprimes} salon(s) vide(s)/orphelin(s) supprimé(s)."
+        )
+
+
+async def reconstruire_tous_vocaux():
+    for guild in client.guilds:
+        try:
+            await reconstruire_vocaux_guild(guild)
+        except Exception as e:
+            print(f"[VOCAL] Reconstruction échouée sur {getattr(guild, 'name', '?')}: {e}")
+
+
+
 class DemandeVocalView(discord.ui.View):
     def __init__(self, guild_id, owner_id, user_id):
         super().__init__(timeout=300)
@@ -3296,7 +5891,7 @@ class DemandeVocalView(discord.ui.View):
         self.owner_id = owner_id
         self.user_id = user_id
 
-    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅")
     async def accepter(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
@@ -3336,7 +5931,7 @@ class DemandeVocalView(discord.ui.View):
             await member.move_to(room)
             DEMANDES_VOCAL.pop(self.user_id, None)
             await interaction.response.edit_message(
-                content=f"✅ **{member.display_name}** a été accepté dans ton salon privé.",
+                content=f"✅ **{member.display_name}** has been accepted into your private room.",
                 view=None,
             )
         except discord.Forbidden:
@@ -3348,7 +5943,7 @@ class DemandeVocalView(discord.ui.View):
             print(f"[VOCAL] Erreur acceptation : {e}")
             await interaction.response.edit_message(content="❌ Une erreur est survenue.", view=None)
 
-    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, emoji="❌")
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌")
     async def refuser(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
@@ -3402,7 +5997,7 @@ async def creer_salon_prive(guild, owner):
     }
 
     room = await guild.create_voice_channel(
-        name=f"🔒・Salon de {owner.display_name}",
+        name=f"{owner.display_name}'s vc",
         category=category,
         overwrites=overwrites_room,
     )
@@ -3441,10 +6036,10 @@ async def creer_salon_prive(guild, owner):
 
 @tree.command(
     name="kickvoc",
-    description="Expulse une personne de ton salon vocal privé."
+    description="Kick someone from your private voice channel"
 )
 @app_commands.guild_only()
-@app_commands.describe(user="La personne à expulser de ton vocal privé.")
+@app_commands.describe(user="The member to kick from your private voice channel")
 async def kickvoc(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     owner = interaction.user
@@ -3458,19 +6053,19 @@ async def kickvoc(interaction: discord.Interaction, user: discord.Member):
 
     if room is None:
         await interaction.response.send_message(
-            "❌ Tu n'as pas de salon vocal privé actif.", ephemeral=True
+            "❌ You do not have an active private voice channel.", ephemeral=True
         )
         return
 
     if user not in room.members:
         await interaction.response.send_message(
-            f"❌ **{user.display_name}** n'est pas dans ton salon vocal.", ephemeral=True
+            f"❌ **{user.display_name}** is not in your private voice channel.", ephemeral=True
         )
         return
 
     if user.id == owner.id:
         await interaction.response.send_message(
-            "❌ Tu ne peux pas t'expulser toi-même de ton propre salon.", ephemeral=True
+            "❌ You cannot kick yourself from your own channel.", ephemeral=True
         )
         return
 
@@ -3480,27 +6075,27 @@ async def kickvoc(interaction: discord.Interaction, user: discord.Member):
         await room.set_permissions(user, overwrite=None)
         await user.move_to(None, reason=f"Expulsé du vocal par {owner}")
         await interaction.response.send_message(
-            f"✅ **{user.display_name}** a été expulsé de ton salon vocal.", ephemeral=True
+            f"✅ **{user.display_name}** has been kicked from your private voice channel.", ephemeral=True
         )
     except discord.Forbidden:
         await interaction.response.send_message(
-            "❌ Je n'ai pas les permissions nécessaires pour expulser cette personne.", ephemeral=True
+            "❌ I do not have permission to kick this member.", ephemeral=True
         )
     except Exception as e:
         print(f"[VOCAL] Erreur kick vocal : {e}")
         await interaction.response.send_message(
-            "❌ Une erreur est survenue pendant l'expulsion.", ephemeral=True
+            "❌ An error occurred while kicking this member.", ephemeral=True
         )
 
 
 @tree.command(
     name="setupvoc",
-    description="Configure le système de salons vocaux privés."
+    description="Configure the private voice channel system"
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    trigger="Le salon vocal que les membres rejoignent pour créer leur salon privé."
+    trigger="The voice channel members join to create their private room"
 )
 async def setupvoc(interaction: discord.Interaction, trigger: discord.VoiceChannel):
     guild = interaction.guild
@@ -3515,12 +6110,12 @@ async def setupvoc(interaction: discord.Interaction, trigger: discord.VoiceChann
             category = await guild.create_category("🔊・VOCAUX PRIVÉS")
         except discord.Forbidden:
             await interaction.response.send_message(
-                "❌ Je n'ai pas la permission de créer une catégorie.", ephemeral=True
+                "❌ I do not have permission to create a category.", ephemeral=True
             )
             return
         except Exception as e:
             print(f"[VOCAL] Erreur création catégorie : {e}")
-            await interaction.response.send_message("❌ Impossible de créer la catégorie.", ephemeral=True)
+            await interaction.response.send_message("❌ Could not create the category.", ephemeral=True)
             return
 
     VOCAL_CONFIG[str(guild.id)] = {
@@ -3530,19 +6125,109 @@ async def setupvoc(interaction: discord.Interaction, trigger: discord.VoiceChann
     sauvegarder_config_vocaux()
 
     await interaction.response.send_message(
-        f"✅ **Système vocal configuré !**\n\n"
-        f"🎙️ Vocal déclencheur : {trigger.mention}\n"
-        f"📁 Catégorie : **{category.name}**\n\n"
-        f"Quand quelqu'un rejoint {trigger.mention}, un salon privé et une salle d'attente seront créés automatiquement.",
+        f"✅ **Private voice system configured!**\n\n"
+        f"🎙️ Trigger channel: {trigger.mention}\n"
+        f"📁 Category: **{category.name}**\n\n"
+        f"When someone joins {trigger.mention}, a private room and a waiting room will be created automatically.",
         ephemeral=True,
     )
+
+
+async def _vocal_nettoyage(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """Supprime le salon privé ET la waiting room uniquement quand le salon est vide,
+    quel que soit le dernier à quitter (le départ du propriétaire seul ne supprime rien).
+    Fonctionne aussi pour les salons reconnus après un redémarrage."""
+    if before.channel is None or before.channel == after.channel:
+        return
+    if not isinstance(before.channel, discord.VoiceChannel):
+        return
+
+    guild = member.guild
+    data = SALONS_VOCAUX.get(before.channel.id)
+    room = None
+    waiting = None
+    room_id = None
+    waiting_id = None
+
+    if data:
+        if data.get("waiting"):
+            room_id = data.get("room_id")
+            waiting_id = before.channel.id
+        else:
+            room_id = before.channel.id
+            waiting_id = data.get("waiting_id")
+        room = guild.get_channel(room_id) if room_id else None
+        waiting = guild.get_channel(waiting_id) if waiting_id else None
+    else:
+        config = VOCAL_CONFIG.get(str(guild.id))
+        if not config:
+            return
+        category = before.channel.category
+        if category is None or category.id != config.get("category_id"):
+            return
+        if not (_est_salle_attente(before.channel) or _est_salon_prive_nom(before.channel)):
+            return
+        paire = _trouver_paire_vocale(category, before.channel)
+        if paire is None:
+            return
+        room, waiting, owner_id = paire
+        if room is None:
+            return
+        room_id = room.id
+        waiting_id = waiting.id if waiting else None
+        if owner_id is not None:
+            _enregistrer_paire_vocale(guild.id, room, waiting, owner_id)
+
+    if room_id is None:
+        return
+
+    await asyncio.sleep(2)
+
+    room = guild.get_channel(room_id)
+    waiting = guild.get_channel(waiting_id) if waiting_id else None
+
+    if room is not None and len(room.members) > 0:
+        return
+
+    SALONS_VOCAUX.pop(room_id, None)
+    if waiting_id:
+        SALONS_VOCAUX.pop(waiting_id, None)
+
+    for user_id, demande in list(DEMANDES_VOCAL.items()):
+        if demande.get("room_id") == room_id or demande.get("waiting_id") == waiting_id:
+            DEMANDES_VOCAL.pop(user_id, None)
+
+    if waiting:
+        for waiting_member in list(waiting.members):
+            try:
+                await waiting_member.move_to(None)
+            except Exception:
+                pass
+
+    if room:
+        try:
+            await room.delete(reason="Temporary voice channel finished")
+        except Exception as e:
+            print(f"[VOCAL] Erreur suppression salon : {e}")
+
+    if waiting:
+        try:
+            await waiting.delete(reason="Temporary waiting room finished")
+        except Exception as e:
+            print(f"[VOCAL] Erreur suppression attente : {e}")
+
+    print(f"[VOCAL] Salons de {member.display_name} supprimés (vocal + waiting room).")
 
 
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
         return
+    await _vocal_entrees(member, before, after)
+    await _vocal_nettoyage(member, before, after)
 
+
+async def _vocal_entrees(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     guild = member.guild
     config = VOCAL_CONFIG.get(str(guild.id))
     if not config:
@@ -3574,15 +6259,28 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             print(f"[VOCAL] Erreur création salon : {e}")
         return
 
-    # 2. Un membre rejoint une salle d'attente.
-    if after.channel and after.channel.id in SALONS_VOCAUX:
+    # 2. Un membre rejoint une salle d'attente (connue en mémoire OU orpheline après redémarrage).
+    if after.channel and isinstance(after.channel, discord.VoiceChannel):
         data = SALONS_VOCAUX.get(after.channel.id)
-        if not data or not data.get("waiting"):
-            return
+        room = None
+        waiting = after.channel
+        owner_id = None
 
-        owner_id = data.get("owner_id")
-        room_id = data.get("room_id")
-        waiting_id = after.channel.id
+        if data and data.get("waiting"):
+            owner_id = data.get("owner_id")
+            room_id = data.get("room_id")
+            room = guild.get_channel(room_id) if room_id else None
+        elif _est_salle_attente(after.channel):
+            category = after.channel.category
+            if category is not None:
+                paire = _trouver_paire_vocale(category, after.channel)
+                if paire is not None:
+                    room, waiting, owner_id = paire
+                    if room is not None and owner_id is not None:
+                        _enregistrer_paire_vocale(guild.id, room, waiting, owner_id)
+
+        if owner_id is None or room is None:
+            return
 
         if member.id == owner_id or member.id in DEMANDES_VOCAL:
             return
@@ -3594,24 +6292,16 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         DEMANDES_VOCAL[member.id] = {
             "guild_id": guild.id,
             "owner_id": owner_id,
-            "room_id": room_id,
-            "waiting_id": waiting_id,
+            "room_id": room.id,
+            "waiting_id": waiting.id,
         }
 
-        room = guild.get_channel(room_id)
-        if room is None:
-            DEMANDES_VOCAL.pop(member.id, None)
-            return
-
         try:
-            # La demande est envoyée dans le chat du vocal privé, pas en DM.
-            # Le propriétaire voit donc la demande directement dans le chat
-            # de son salon vocal et peut accepter/refuser avec les boutons.
             await room.send(
-                f"🔔 **Demande d'accès à ton salon**\n\n"
-                f"👤 **{member.display_name}** veut rejoindre ton salon privé.\n\n"
-                f"📍 Il/elle est actuellement dans **{after.channel.name}**.\n\n"
-                f"Choisis une action :",
+                f"🔔 **Access request to your room**\n\n"
+                f"👤 **{member.display_name}** wants to join your private room.\n\n"
+                f"📍 They are currently in **{after.channel.name}**.\n\n"
+                f"Choose an action:",
                 view=DemandeVocalView(guild.id, owner_id, member.id),
             )
         except discord.Forbidden:
@@ -3620,56 +6310,292 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             print(f"[VOCAL] Erreur envoi demande dans le chat vocal : {e}")
         return
 
-    # 3. Le propriétaire quitte son salon : suppression des salons temporaires.
-    if before.channel and before.channel.id in SALONS_VOCAUX:
-        data = SALONS_VOCAUX.get(before.channel.id)
-        if not data or data.get("owner_id") != member.id:
+
+
+# ---------- FUN (/fun, /stopfun) ----------
+FUN_CIBLES = defaultdict(set)      # guild_id -> {user_id, ...} (en mémoire : vidé au redémarrage)
+FUN_DERNIER = {}                   # (guild_id, user_id) -> timestamp de la dernière réponse
+FUN_DERNIER_MODELE = {}            # (guild_id, user_id) -> index du dernier modèle (évite les répétitions)
+FUN_COOLDOWN = 3                   # secondes minimum entre deux réponses pour un même membre
+
+# {name} = pseudo du membre, {quote} = début de son message
+FUN_MESSAGES = [
+    "Oh look, **{name}** just spoke. Everybody act normal. 👀",
+    "**{name}** said something. Bold move. 🫡",
+    "Breaking news: **{name}** has entered the chat... again. 📰",
+    "Ladies and gentlemen, **{name}** has something to say! 🎤",
+    "Another message from **{name}**? The people demand more! 🍿",
+    "**{name}** is typing... and the server will never be the same. ✨",
+    "Noted, **{name}**. I'll pass that on to absolutely nobody. 📝",
+    "I was about to say something, but then **{name}** spoke. Iconic. 😌",
+    "The council has reviewed **{name}**'s message. Verdict: certified moment. ⚖️",
+    "Somebody check on **{name}**, they're on a roll today. 🔥",
+]
+FUN_MESSAGES_CITATION = [
+    "Did **{name}** just say \"{quote}\"? Legendary. 🏆",
+    "**{name}** really typed \"{quote}\" and hit send. Respect. 🫡",
+    "\"{quote}\" - **{name}**, 2026. Remember this day. 🗿",
+    "Let the record show that **{name}** said: \"{quote}\" 📜",
+]
+
+
+async def fun_repondre(message: discord.Message, membre: discord.Member):
+    """Si le membre est ciblé par /fun, le bot répond avec un message personnalisé."""
+    cibles = FUN_CIBLES.get(message.guild.id)
+    if not cibles or membre.id not in cibles:
+        return
+
+    cle = (message.guild.id, membre.id)
+    maintenant = time.time()
+    if maintenant - FUN_DERNIER.get(cle, 0) < FUN_COOLDOWN:
+        return
+    FUN_DERNIER[cle] = maintenant
+
+    # Début du message (nettoyé : pas de mentions ni de mise en forme)
+    extrait = " ".join((message.content or "").split())
+    extrait = discord.utils.escape_markdown(discord.utils.escape_mentions(extrait))
+    extrait = extrait.replace('"', "'")
+    if len(extrait) > 60:
+        extrait = extrait[:57] + "..."
+
+    modeles = list(FUN_MESSAGES)
+    if extrait:
+        modeles += FUN_MESSAGES_CITATION
+    # on évite de répéter deux fois de suite le même modèle
+    dernier = FUN_DERNIER_MODELE.get(cle)
+    choix = [i for i in range(len(modeles)) if modeles[i] != dernier] or list(range(len(modeles)))
+    modele = modeles[random.choice(choix)]
+    FUN_DERNIER_MODELE[cle] = modele
+
+    texte = modele.format(
+        name=discord.utils.escape_markdown(membre.display_name),
+        quote=extrait,
+    )
+    try:
+        await message.reply(texte, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as e:
+        print(f"[FUN] Impossible d'envoyer la réponse : {e}")
+
+
+@tree.command(name="fun", description="Make the bot send a custom message every time a member writes")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(user="The member the bot will react to")
+async def fun_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("You need the **Manage Messages** permission.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("You can't target a bot.", ephemeral=True)
+        return
+    if user.id in FUN_CIBLES[interaction.guild.id]:
+        await interaction.response.send_message(f"Fun mode is already active for {user.mention}.", ephemeral=True)
+        return
+    FUN_CIBLES[interaction.guild.id].add(user.id)
+    await interaction.response.send_message(
+        f"🎉 Fun mode enabled for {user.mention}. I'll answer every message they send. Use `/stopfun` to stop.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="stopfun", description="Stop the fun mode (for one member, or for everyone)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(user="The member to stop (leave empty to stop everyone)")
+async def stopfun_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("You need the **Manage Messages** permission.", ephemeral=True)
+        return
+    cibles = FUN_CIBLES[interaction.guild.id]
+    if user is not None:
+        if user.id not in cibles:
+            await interaction.response.send_message(f"Fun mode isn't active for {user.mention}.", ephemeral=True)
             return
+        cibles.discard(user.id)
+        await interaction.response.send_message(f"🛑 Fun mode stopped for {user.mention}.", ephemeral=True)
+        return
+    if not cibles:
+        await interaction.response.send_message("Fun mode isn't active for anyone.", ephemeral=True)
+        return
+    nb = len(cibles)
+    cibles.clear()
+    await interaction.response.send_message(f"🛑 Fun mode stopped for everyone ({nb} member(s)).", ephemeral=True)
 
-        if data.get("waiting"):
-            room_id = data.get("room_id")
-            waiting_id = before.channel.id
-        else:
-            room_id = before.channel.id
-            waiting_id = data.get("waiting_id")
 
-        room = guild.get_channel(room_id)
-        waiting = guild.get_channel(waiting_id)
+# ---------- HELP ----------
+@tree.command(
+    name="help",
+    description="Show the commands available to every member",
+)
+@app_commands.guild_only()
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 Member commands",
+        description="Commands anyone can use on this server.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="📊 Levels",
+        value=(
+            "`/rank [user]` — Show your level (or another member's)\n"
+            "`/myrank` — Show your own level\n"
+            "`/leaderboard` — Top 10 levels on the server"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎬 Media",
+        value=(
+            "`/dl [link]` — Download a TikTok / Streamable video\n"
+            "`!dl` — Reply to a message with a link to download it\n"
+            "`/songfinder fichier:` — Recognize a song from an audio/video file\n"
+            "`!songfinder` — Reply to a message with an audio/video file to identify it"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔊 Private voice",
+        value="`/kickvoc user:` — Kick someone from **your** private voice channel",
+        inline=False,
+    )
+    embed.add_field(
+        name="ℹ️ Help",
+        value="`/help` — Show this message",
+        inline=False,
+    )
+    embed.set_footer(text="Admins: use /adminhelp for the full command list")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        await asyncio.sleep(2)
 
-        if room and any(m.id == member.id for m in room.members):
-            return
+@tree.command(
+    name="adminhelp",
+    description="Show all admin / staff commands (administrators only)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def adminhelp_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
 
-        for user_id, demande in list(DEMANDES_VOCAL.items()):
-            if demande.get("room_id") == room_id or demande.get("waiting_id") == waiting_id:
-                DEMANDES_VOCAL.pop(user_id, None)
+    embed = discord.Embed(
+        title="🛠️ Admin & staff commands",
+        description="Full list of moderation and configuration commands.",
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(
+        name="🔨 Moderation",
+        value=(
+            "`/ban` `/kick` `/timeout` — Sanction a member\n"
+            "`/unban` `/untimeout` — Remove a sanction\n"
+            "`/deletemessage` — Delete a member's messages from the last 5 minutes"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Anti-raid & anti-nuke",
+        value=(
+            "`/raidstatus` `/raidunlock` — Anti-raid status / unlock\n"
+            "`/setupantinuke` — Enable anti-nuke\n"
+            "`/antinuke_status` `/antinuke_whitelist` `/antinuke_snapshot` — Anti-nuke tools"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🚫 Filters & files",
+        value=(
+            "`/addmot` `/removemot` `/importmots` — Banned words list\n"
+            "`/blockfile` `/unblockfile` `/listblocked` — Block premium file reuploads\n"
+            "`/setuphoney` — Create the honeypot channel"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📈 Levels & stats",
+        value=(
+            "`/setuplevels` — Level-up announcement channel\n"
+            "`/setxp` `/importlevels` — Set / import levels\n"
+            "`/setupstat` `/checkmembers` — Role counters\n"
+            "`/setupdsstat` `/dsstatnow` `/dsstatgraph` — Daily server report"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎫 Tickets & logs",
+        value=(
+            "`/setupticket` — Ticket panel\n"
+            "`/setuplogs` — Bot log channel\n"
+            "`/embed` `/button` — Custom embed & Accept rules button"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📱 TikTok & voice",
+        value=(
+            "`/tiktokadd` `/tiktokremove` `/tiktokcheck` — Follower milestone alerts\n"
+            "`/setupvoc` — Private voice system"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎉 Fun",
+        value=(
+            "`/fun user:` — The bot answers every message of this member\n"
+            "`/stopfun [user]` — Stop it (for one member, or everyone)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="👤 Also available to members",
+        value="`/rank` `/myrank` `/leaderboard` `/dl` `/songfinder` `!dl` `!songfinder` `/kickvoc` `/help`",
+        inline=False,
+    )
+    embed.set_footer(text="All command descriptions are in English in the Discord UI")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        if waiting:
-            for waiting_member in list(waiting.members):
-                try:
-                    await waiting_member.move_to(None)
-                except Exception:
-                    pass
-
-        if room:
-            try:
-                await room.delete(reason="Salon vocal temporaire terminé")
-            except Exception as e:
-                print(f"[VOCAL] Erreur suppression salon : {e}")
-
-        if waiting:
-            try:
-                await waiting.delete(reason="Salle d'attente temporaire terminée")
-            except Exception as e:
-                print(f"[VOCAL] Erreur suppression attente : {e}")
-
-        SALONS_VOCAUX.pop(room_id, None)
-        SALONS_VOCAUX.pop(waiting_id, None)
-        print(f"[VOCAL] Salon de {member.display_name} supprimé.")
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("[ERREUR] Variable DISCORD_TOKEN manquante (Render : onglet Environment).")
-client.run(TOKEN)
+
+
+async def principal():
+    """Lance le bot. Si la connexion échoue (429 de Discord, token invalide, panne...), on ATTEND
+    avant de quitter : quitter tout de suite fait redémarrer Render en boucle, et chaque
+    redémarrage retente la connexion, ce qui prolonge un blocage 429."""
+    global etat_connexion
+    import traceback
+    discord.utils.setup_logging()
+    await demarrer_serveur_web()  # port ouvert tout de suite (Render), même si la connexion échoue
+    attente = None
+    try:
+        async with client:
+            await client.start(TOKEN)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            retry = None
+            try:
+                retry = float(e.response.headers.get("Retry-After", ""))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            attente = int(min(max(retry + 60, 1800) if retry else 1800, 3600))
+            etat_connexion = f"Discord bloque l'adresse IP du serveur (429). Prochain essai dans {attente // 60} min."
+            print(f"[ERREUR] Discord bloque la connexion (429). Pause de {attente // 60} min avant le prochain essai.")
+        else:
+            attente = 300
+            etat_connexion = f"Erreur Discord {e.status} : {e}. Prochain essai dans 5 min."
+            traceback.print_exc()
+    except Exception as e:
+        attente = 300
+        etat_connexion = f"Erreur : {type(e).__name__}: {e}. Prochain essai dans 5 min."
+        traceback.print_exc()
+    if attente:
+        await asyncio.sleep(attente)
+        raise SystemExit(1)  # Render relance le bot : un seul essai de connexion à chaque fois
+
+
+try:
+    asyncio.run(principal())
+except KeyboardInterrupt:
+    pass
