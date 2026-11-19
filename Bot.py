@@ -82,6 +82,8 @@ class MonBot(discord.Client):
         boucle_dsstat.start()       # rapport quotidien du serveur
         verif_tiktok.start()        # alertes de paliers d'abonnés TikTok
         verif_videos.start()        # annonces de nouvelles vidéos (RSSHub, toutes les 5 min)
+        if relay_notifyme is not None:
+            relay_notifyme.verif_notify.start()  # /post : relais du salon Notify Me (toutes les 5 min)
         boucle_snapshots_antinuke.start()  # snapshots anti-nuke
         await demarrer_serveur_web()  # utile seulement sur Render (Web Service)
         await telecharger_mots()      # liste de mots interdits depuis GitHub (si MOTS_URL est défini)
@@ -129,6 +131,15 @@ async def erreur_commande(interaction: discord.Interaction, error: app_commands.
 async def on_interaction(interaction: discord.Interaction):
     nom = (interaction.data or {}).get("name") or (interaction.data or {}).get("custom_id", "?")
     print(f"[INTERACTION] {interaction.type.name} « {nom} » de {interaction.user} sur {getattr(interaction.guild, 'name', 'DM')}")
+
+# ---------- SERVEUR PRINCIPAL ----------
+# Tous les IDs ci-dessous (salons, rôles, catégorie...) n'existent que dans UN serveur : le serveur principal.
+# Mets son ID dans la variable d'environnement GUILD_PRINCIPAL_ID (clic droit sur le serveur > Copier l'identifiant).
+# Si elle est vide, le bot reconnaît le serveur principal au fait qu'il contient le salon CHANNEL_ID.
+# Si le bot n'est dans AUCUN serveur principal, il passe tout seul sur le script relay_notifyme.py.
+_gp = os.getenv("GUILD_PRINCIPAL_ID", "").strip()
+GUILD_PRINCIPAL_ID = int(_gp) if _gp.isdigit() else 1397311784364281937  # ID du serveur principal (la variable d'environnement GUILD_PRINCIPAL_ID est prioritaire)
+SCRIPT_RELAIS = "relay_notifyme.py"
 
 CHANNEL_ID = 1420172051448201216  # salon réception mis à jour[cite: 2]
 DUREE_TIMEOUT = timedelta(hours=1)
@@ -430,7 +441,55 @@ def ordinal(n):
     return f"{n}{suffixe}"
 
 
+def est_serveur_principal(guild) -> bool:
+    """True si ce serveur est celui où les IDs en dur (salons, rôles...) sont valables."""
+    if guild is None:
+        return False
+    if GUILD_PRINCIPAL_ID:
+        return guild.id == GUILD_PRINCIPAL_ID
+    return guild.get_channel(CHANNEL_ID) is not None
+
+
+_script_relais_a_lancer = None  # chemin de relay_notifyme.py si le bot doit changer de script
+
+
+async def verifier_serveur_ou_relais() -> bool:
+    """Appelé au démarrage. Retourne True si le bot N'EST PAS dans le serveur principal :
+    il se déconnecte alors et principal() lance relay_notifyme.py à sa place."""
+    global _script_relais_a_lancer
+    if _script_relais_a_lancer:
+        return True
+    if any(g.unavailable for g in client.guilds):
+        # Panne Discord : on ne bascule surtout pas en mode relais par erreur
+        print("[SERVEUR] Un serveur est indisponible (panne Discord ?) : vérification repoussée.")
+        return False
+    if any(est_serveur_principal(g) for g in client.guilds):
+        print("[SERVEUR] Serveur principal trouvé : le bot démarre normalement.")
+        return False
+    chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), SCRIPT_RELAIS)
+    if not os.path.exists(chemin):
+        print(f"[SERVEUR] Pas dans le serveur principal, mais {SCRIPT_RELAIS} est introuvable ({chemin}) : "
+              f"le bot continue normalement.")
+        return False
+    print(f"[SERVEUR] Le bot n'est pas dans le serveur principal : passage sur {SCRIPT_RELAIS}.")
+    _script_relais_a_lancer = chemin
+    await client.close()  # principal() lance le script relais juste après
+    return True
+
+
+def lancer_script_relais(chemin):
+    import subprocess
+    import sys
+    print(f"[SERVEUR] Lancement de {os.path.basename(chemin)}...", flush=True)
+    if os.name == "nt":  # Windows : os.execv se comporte mal, on lance le script et on attend
+        subprocess.call([sys.executable, chemin])
+        raise SystemExit(0)
+    os.execv(sys.executable, [sys.executable, chemin])  # remplace ce processus (Render reste content)
+
+
 async def get_salon(guild):
+    if not est_serveur_principal(guild):
+        return None  # sinon fetch_channel irait chercher le salon du serveur principal depuis un autre serveur
     salon = guild.get_channel(CHANNEL_ID)
     if salon is None:
         try:
@@ -534,6 +593,8 @@ async def synchroniser(guild):
 async def on_ready():
     global nettoyage_fait, honey_view_registered, regles_view_registered, _hash_cmd
     print(f"Connecté en tant que {client.user} | {len(MOTIFS)} mots interdits chargés")
+    if await verifier_serveur_ou_relais():
+        return  # pas dans le bon serveur : principal() lance relay_notifyme.py
     await client.change_presence(status=discord.Status.online, activity=discord.CustomActivity(name=STATUT))
     if not honey_view_registered:
         client.add_view(HoneypotCounterView())
@@ -649,7 +710,7 @@ async def activer_raid_mode(guild: discord.Guild, nb_joins: int):
 
     # Annonce publique
     announce = guild.get_channel(RAID_ANNOUNCE_CHANNEL_ID)
-    if announce is None:
+    if announce is None and est_serveur_principal(guild):
         try:
             announce = await guild.fetch_channel(RAID_ANNOUNCE_CHANNEL_ID)
         except Exception:
@@ -1450,10 +1511,20 @@ def nom_depuis_url(url: str) -> str:
 
 
 async def recuperer_flux_videos(session: aiohttp.ClientSession, url: str) -> list:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DiscordBot)", "Accept": "application/rss+xml, application/xml, */*"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
     async with session.get(url, headers=headers) as r:
         if r.status != 200:
-            raise RuntimeError(f"the server answered HTTP {r.status}")
+            # RSSHub explique souvent la raison dans la page d'erreur : on l'affiche
+            try:
+                corps = (await r.text())[:1500]
+            except Exception:
+                corps = ""
+            corps = re.sub(r"<[^>]+>", " ", corps)
+            corps = re.sub(r"\s+", " ", corps).strip()[:220]
+            raise RuntimeError(f"the server answered HTTP {r.status}" + (f" — {corps}" if corps else ""))
         brut = await r.read()
     if len(brut) > 5 * 1024 * 1024:
         raise RuntimeError("feed too large")
@@ -1692,6 +1763,231 @@ async def stopfollow_autocomplete(interaction: discord.Interaction, current: str
         if c.get("guild_id") != interaction.guild_id:
             continue
         libelle = f"{c.get('name')} — {c.get('url')}"[:100]
+        if saisie in libelle.lower():
+            choix.append(app_commands.Choice(name=libelle, value=cle))
+    return choix[:25]
+
+
+
+# ---------- RELAIS NOTIFYME (salon d'un autre serveur -> salon de ce serveur, aux couleurs du bot) ----------
+# Principe : NotifyMe poste ses alertes TikTok dans un salon d'un serveur "relais" où le bot est aussi présent.
+# Le bot lit ce message, reprend son contenu et le republie dans le salon choisi sur le serveur principal,
+# dans un embed violet (COULEUR_EMBED) avec un bouton "Watch on TikTok". Commandes : /relay et /stoprelay.
+FICHIER_RELAIS = "relais_notifyme.json"
+RELAIS = None                        # {id du salon source (str): config}, chargé au premier usage
+RELAIS_VUS = deque(maxlen=200)       # (salon source, lien) déjà relayés : évite les doublons
+RE_LIEN_TIKTOK = re.compile(r"https?://(?:[\w-]+\.)?tiktok\.com/[^\s<>\"')\]]+", re.I)
+RE_MENTIONS_RELAIS = re.compile(r"<@[!&]?\d+>|@everyone|@here")
+
+
+def extraire_relais(message):
+    """Lit un message (texte + embeds) et retourne (lien, titre, texte, image).
+    Retourne None s'il n'y a aucun lien TikTok (le message n'est alors pas relayé)."""
+    parties_recherche = [message.content or ""]
+    parties_texte = [message.content or ""]
+    titre = None
+    image = None
+    for e in message.embeds:
+        parties_recherche += [e.url or "", e.title or "", e.description or ""]
+        if e.description:
+            parties_texte.append(e.description)
+        for f in e.fields:
+            parties_recherche.append(f"{f.name} {f.value}")
+            parties_texte.append(f"**{f.name}** {f.value}")
+        titre = titre or e.title
+        if image is None:
+            image = getattr(getattr(e, "image", None), "url", None) or getattr(getattr(e, "thumbnail", None), "url", None)
+    m = RE_LIEN_TIKTOK.search("\n".join(parties_recherche))
+    if not m:
+        return None
+    lien = m.group(0).rstrip(".,;!")
+    texte = "\n".join(p for p in parties_texte if p)
+    texte = RE_LIEN_TIKTOK.sub("", texte)              # le lien est dans le titre et le bouton
+    texte = RE_MENTIONS_RELAIS.sub("", texte)          # pas de ping venant de l'autre serveur
+    texte = re.sub(r"\(\s*\)|\[\s*\]", "", texte)   # parenthèses vides laissées par le lien retiré
+    texte = re.sub(r"[ \t]+", " ", texte)
+    texte = re.sub(r"\n{3,}", "\n\n", texte).strip()[:3800]
+    return lien, (titre or "").strip()[:256], texte, image
+# (fin des fonctions pures du relais)
+
+
+def charger_relais() -> dict:
+    global RELAIS
+    if RELAIS is None:
+        try:
+            data = storage.charger(FICHIER_RELAIS)
+        except Exception as e:
+            print(f"[RELAIS] Lecture impossible : {e}")
+            return {}
+        RELAIS = data["routes"] if isinstance(data, dict) and isinstance(data.get("routes"), dict) else {}
+    return RELAIS
+
+
+def sauver_relais():
+    storage.sauver(FICHIER_RELAIS, {"routes": RELAIS})
+
+
+async def relais_notify(message: discord.Message):
+    """Appelé pour chaque message de bot/webhook : si son salon est une source, on le republie."""
+    try:
+        if message.author.id == client.user.id:
+            return
+        route = charger_relais().get(str(message.channel.id))
+        if not route:
+            return
+        extrait = extraire_relais(message)
+        if not extrait:
+            return
+        lien, titre, texte, image = extrait
+        cle = (message.channel.id, lien)
+        if cle in RELAIS_VUS:
+            return
+        RELAIS_VUS.append(cle)
+
+        canal = client.get_channel(route["dest_channel_id"])
+        if canal is None:
+            canal = await client.fetch_channel(route["dest_channel_id"])
+        embed = discord.Embed(
+            title=titre or "🎬 New TikTok video",
+            url=lien,
+            description=texte or None,
+            color=COULEUR_EMBED,
+            timestamp=discord.utils.utcnow(),
+        )
+        if image:
+            embed.set_image(url=image)
+        embed.set_footer(text=STATUT)
+        vue = discord.ui.View()
+        vue.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Watch on TikTok", url=lien))
+        ping = f"<@&{route['ping_role_id']}>" if route.get("ping_role_id") else None
+        await canal.send(
+            content=ping,
+            embed=embed,
+            view=vue,
+            allowed_mentions=discord.AllowedMentions(roles=True, everyone=False, users=False),
+        )
+        print(f"[RELAIS] Alerte relayée vers #{getattr(canal, 'name', '?')} : {lien}")
+    except Exception as e:
+        print(f"[RELAIS] Erreur : {e!r}")
+
+
+@tree.command(name="relay", description="Repost the TikTok alerts of a channel from another server here, in the bot's colors")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    source_channel_id="ID of the channel where NotifyMe posts (in the other server, where I must also be)",
+    destination="Channel of this server where the alert is reposted",
+    ping="Role of this server to ping with the alert. Optional.",
+)
+async def relay_cmd(
+    interaction: discord.Interaction,
+    source_channel_id: str,
+    destination: discord.TextChannel,
+    ping: Optional[discord.Role] = None,
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    texte_id = source_channel_id.strip()
+    if not re.fullmatch(r"\d{15,22}", texte_id):
+        await interaction.response.send_message(
+            "❌ Invalid ID. Enable Developer Mode in Discord, right-click the channel and choose **Copy Channel ID**.",
+            ephemeral=True,
+        )
+        return
+    source = client.get_channel(int(texte_id))
+    if not isinstance(source, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ I can't see this channel. Make sure **I am in the other server** and can view that channel.",
+            ephemeral=True,
+        )
+        return
+    if source.id == destination.id:
+        await interaction.response.send_message("❌ The source and the destination must be different channels.", ephemeral=True)
+        return
+
+    # Sécurité : il faut aussi être administrateur du serveur source (sinon on pourrait lire les salons des autres)
+    guilde_src = source.guild
+    membre = guilde_src.get_member(interaction.user.id)
+    if membre is None:
+        try:
+            membre = await guilde_src.fetch_member(interaction.user.id)
+        except discord.HTTPException:
+            membre = None
+    if membre is None or not (membre.guild_permissions.administrator or guilde_src.owner_id == membre.id):
+        await interaction.response.send_message(
+            "❌ You must also be an **administrator of the source server** to relay its messages.", ephemeral=True
+        )
+        return
+    if not source.permissions_for(guilde_src.me).view_channel:
+        await interaction.response.send_message(f"❌ I can't view **#{source.name}** in {guilde_src.name}.", ephemeral=True)
+        return
+    perms = destination.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            f"❌ In {destination.mention} I need **View Channel**, **Send Messages** and **Embed Links**.", ephemeral=True
+        )
+        return
+
+    routes = charger_relais()
+    routes[str(source.id)] = {
+        "source_channel_id": source.id,
+        "source_guild_id": guilde_src.id,
+        "dest_channel_id": destination.id,
+        "dest_guild_id": interaction.guild.id,
+        "ping_role_id": ping.id if ping else None,
+    }
+    try:
+        sauver_relais()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Storage error: {e}", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"✅ Every TikTok alert posted in **#{source.name}** ({guilde_src.name}) will be reposted in {destination.mention}"
+        f"{' with ' + ping.mention if ping else ''}, in my colors.\n"
+        "Use NotifyMe's *test notification* to try it. Only messages that contain a TikTok link are relayed.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="stoprelay", description="Stop reposting the alerts of a source channel")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(relay="The relay to stop (pick it in the list, or paste the source channel ID)")
+async def stoprelay_cmd(interaction: discord.Interaction, relay: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    routes = charger_relais()
+    cle = relay.strip()
+    route = routes.get(cle)
+    if not route or route.get("dest_guild_id") != interaction.guild.id:
+        await interaction.response.send_message(
+            "❌ This relay doesn't exist. Pick one from the list that appears when you type.", ephemeral=True
+        )
+        return
+    routes.pop(cle)
+    try:
+        sauver_relais()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Storage error: {e}", ephemeral=True)
+        return
+    await interaction.response.send_message("✅ Relay stopped.", ephemeral=True)
+
+
+@stoprelay_cmd.autocomplete("relay")
+async def stoprelay_autocomplete(interaction: discord.Interaction, current: str):
+    saisie = current.lower()
+    choix = []
+    for cle, r in charger_relais().items():
+        if r.get("dest_guild_id") != interaction.guild_id:
+            continue
+        src = client.get_channel(r["source_channel_id"])
+        dst = client.get_channel(r["dest_channel_id"])
+        nom_src = f"#{src.name} ({src.guild.name})" if src else f"channel {r['source_channel_id']}"
+        nom_dst = f"#{dst.name}" if dst else f"channel {r['dest_channel_id']}"
+        libelle = f"{nom_src} → {nom_dst}"[:100]
         if saisie in libelle.lower():
             choix.append(app_commands.Choice(name=libelle, value=cle))
     return choix[:25]
@@ -3874,6 +4170,10 @@ async def traiter_songfinder_message(message: discord.Message):
 # ---------- FILTRE ----------
 @client.event
 async def on_message(message):
+    # Relais NotifyMe : on lit les messages des bots dans les salons "source" avant de les ignorer
+    if message.guild is not None and message.author.bot:
+        await relais_notify(message)
+
     if message.author.bot or message.guild is None:
         return
 
@@ -5411,7 +5711,7 @@ async def antinuke_sanctionner(guild: discord.Guild, acteur: discord.Member | di
 
     # Annonce dans le salon d'annonce anti-raid si dispo
     announce = guild.get_channel(RAID_ANNOUNCE_CHANNEL_ID)
-    if announce is None:
+    if announce is None and est_serveur_principal(guild):
         try:
             announce = await guild.fetch_channel(RAID_ANNOUNCE_CHANNEL_ID)
         except Exception:
@@ -7008,7 +7308,18 @@ async def adminhelp_cmd(interaction: discord.Interaction):
         name="📹 Video announcements",
         value=(
             "`/follow rss_link: channel:` — Announce the new videos of an RSS feed (RSSHub...) in a channel, checked every 5 min\n"
-            "`/stopfollow feed:` — Stop following a feed"
+            "`/stopfollow feed:` — Stop following a feed\n"
+            "`/look channel: name:` — (in the NotifyMe server) Save a Notify Me channel under a name\n"
+            "`/post name: channel: [message:] [now:]` — Every 5 min, repost the new message of that Notify Me channel here with your message\n"
+            "`/stoplook name:` `/stoppost name:` — Stop one"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📡 NotifyMe relay",
+        value=(
+            "`/relay source_channel_id: destination:` — Repost the TikTok alerts NotifyMe posts in another server here, in my colors\n"
+            "`/stoprelay relay:` — Stop a relay"
         ),
         inline=False,
     )
@@ -7028,6 +7339,16 @@ async def adminhelp_cmd(interaction: discord.Interaction):
     embed.set_footer(text="All command descriptions are in English in the Discord UI")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+
+# ---------- /post : relais Notify Me -> serveur principal (script relay_notifyme.py) ----------
+# /post et /stoppost deviennent des commandes de ce bot ; la boucle (toutes les 5 min) démarre dans setup_hook.
+try:
+    import relay_notifyme
+    relay_notifyme.installer(client, tree)
+except Exception as e:
+    relay_notifyme = None
+    print(f"[POST] relay_notifyme.py non chargé : {e!r}")
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -7065,6 +7386,9 @@ async def principal():
         attente = 300
         etat_connexion = f"Erreur : {type(e).__name__}: {e}. Prochain essai dans 5 min."
         traceback.print_exc()
+    if _script_relais_a_lancer:
+        lancer_script_relais(_script_relais_a_lancer)  # ne revient pas (sauf Windows)
+        return
     if attente:
         await asyncio.sleep(attente)
         raise SystemExit(1)  # Render relance le bot : un seul essai de connexion à chaque fois
