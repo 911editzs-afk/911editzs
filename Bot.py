@@ -6313,7 +6313,7 @@ async def _vocal_entrees(member: discord.Member, before: discord.VoiceState, aft
 
 
 # ---------- FUN (/fun, /stopfun) ----------
-FUN_CIBLES = defaultdict(set)      # guild_id -> {user_id, ...} (en mémoire : vidé au redémarrage)
+FUN_CIBLES = defaultdict(dict)     # guild_id -> {user_id: message personnalisé ou None} (en mémoire)
 FUN_DERNIER = {}                   # (guild_id, user_id) -> timestamp de la dernière réponse
 FUN_DERNIER_MODELE = {}            # (guild_id, user_id) -> index du dernier modèle (évite les répétitions)
 FUN_COOLDOWN = 3                   # secondes minimum entre deux réponses pour un même membre
@@ -6358,43 +6358,57 @@ async def fun_repondre(message: discord.Message, membre: discord.Member):
     if len(extrait) > 60:
         extrait = extrait[:57] + "..."
 
-    modeles = list(FUN_MESSAGES)
-    if extrait:
-        modeles += FUN_MESSAGES_CITATION
+    perso = cibles.get(membre.id)   # message choisi avec /fun (peut contenir plusieurs choix séparés par |)
+    if perso:
+        modeles = [m.strip() for m in perso.split("|") if m.strip()]
+    else:
+        modeles = list(FUN_MESSAGES)
+        if extrait:
+            modeles += FUN_MESSAGES_CITATION
     # on évite de répéter deux fois de suite le même modèle
     dernier = FUN_DERNIER_MODELE.get(cle)
     choix = [i for i in range(len(modeles)) if modeles[i] != dernier] or list(range(len(modeles)))
     modele = modeles[random.choice(choix)]
     FUN_DERNIER_MODELE[cle] = modele
 
-    texte = modele.format(
-        name=discord.utils.escape_markdown(membre.display_name),
-        quote=extrait,
-    )
+    # replace (et non format) : le texte du staff peut contenir des { }
+    texte = modele.replace("{name}", discord.utils.escape_markdown(membre.display_name))
+    texte = texte.replace("{quote}", extrait)[:2000]
     try:
         await message.reply(texte, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         print(f"[FUN] Impossible d'envoyer la réponse : {e}")
 
 
-@tree.command(name="fun", description="Make the bot send a custom message every time a member writes")
+@tree.command(name="fun", description="Choose what the bot says every time a member writes")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(user="The member the bot will react to")
-async def fun_cmd(interaction: discord.Interaction, user: discord.Member):
+@app_commands.describe(
+    user="The member the bot will react to",
+    message="What the bot says. Use {name} for their name, {quote} for their message, | to give several choices",
+)
+async def fun_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    message: Optional[app_commands.Range[str, 1, 300]] = None,
+):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("You need the **Manage Messages** permission.", ephemeral=True)
         return
     if user.bot:
         await interaction.response.send_message("You can't target a bot.", ephemeral=True)
         return
-    if user.id in FUN_CIBLES[interaction.guild.id]:
-        await interaction.response.send_message(f"Fun mode is already active for {user.mention}.", ephemeral=True)
-        return
-    FUN_CIBLES[interaction.guild.id].add(user.id)
+    deja = user.id in FUN_CIBLES[interaction.guild.id]
+    FUN_CIBLES[interaction.guild.id][user.id] = message
+    apercu = (
+        f"I'll say: {discord.utils.escape_markdown(message)}" if message
+        else "I'll use random messages."
+    )
+    debut = "updated" if deja else "enabled"
     await interaction.response.send_message(
-        f"🎉 Fun mode enabled for {user.mention}. I'll answer every message they send. Use `/stopfun` to stop.",
+        f"🎉 Fun mode {debut} for {user.mention}. {apercu}\nUse `/stopfun` to stop.",
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -6411,7 +6425,7 @@ async def stopfun_cmd(interaction: discord.Interaction, user: Optional[discord.M
         if user.id not in cibles:
             await interaction.response.send_message(f"Fun mode isn't active for {user.mention}.", ephemeral=True)
             return
-        cibles.discard(user.id)
+        cibles.pop(user.id, None)
         await interaction.response.send_message(f"🛑 Fun mode stopped for {user.mention}.", ephemeral=True)
         return
     if not cibles:
@@ -6540,7 +6554,7 @@ async def adminhelp_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="🎉 Fun",
         value=(
-            "`/fun user:` — The bot answers every message of this member\n"
+            "`/fun user: [message:]` — The bot answers every message of this member with the text you choose\n"
             "`/stopfun [user]` — Stop it (for one member, or everyone)"
         ),
         inline=False,
