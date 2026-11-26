@@ -198,26 +198,36 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             return False
 
     snapshot = {}
+    hides = [int(x) for x in (cfg.get("hide_channel_ids") or [])]
     for ch in guild.channels:
         if ch.id in proteges:
             continue
+        if hides and ch.id not in hides:
+            continue
         try:
-            snapshot[str(ch.id)] = _serialiser_ow(ch)
+            ev = ch.overwrites_for(guild.default_role).view_channel
+            snapshot[str(ch.id)] = {"everyone_view": ev, "overwrites": _serialiser_ow(ch)}
         except Exception:
             continue
 
-    me = guild.me
-    for ch in list(guild.channels):
+    # Liste explicite si configurée, sinon tous sauf protégés
+    hides = [int(x) for x in (cfg.get("hide_channel_ids") or [])]
+    cibles = []
+    for ch in guild.channels:
         if ch.id in proteges:
             continue
+        if hides and ch.id not in hides:
+            continue
+        cibles.append(ch)
+
+    for ch in cibles:
         try:
-            ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-            if me:
-                ow[me] = discord.PermissionOverwrite(
-                    view_channel=True, manage_channels=True, manage_permissions=True,
-                    send_messages=True, embed_links=True,
-                )
-            await ch.edit(overwrites=ow, reason=f"Watchdog lockdown: {raison}")
+            # Ne pas écraser toutes les overwrites — seulement @everyone
+            await ch.set_permissions(
+                guild.default_role,
+                view_channel=False,
+                reason=f"Watchdog lockdown: {raison}",
+            )
         except Exception as e:
             print(f"[WATCHDOG] hide #{getattr(ch, 'name', ch.id)}: {e}")
 
@@ -259,12 +269,21 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
     if not cfg.get("locked"):
         return False
 
-    for ch_id, ow_data in (cfg.get("snapshot") or {}).items():
+    for ch_id, data in (cfg.get("snapshot") or {}).items():
         ch = guild.get_channel(int(ch_id))
         if ch is None:
             continue
         try:
-            await ch.edit(overwrites=_appliquer_ow(guild, ow_data), reason="Watchdog: main bot back")
+            if isinstance(data, dict) and "everyone_view" in data:
+                await ch.set_permissions(
+                    guild.default_role,
+                    view_channel=data.get("everyone_view"),
+                    reason="Watchdog: main bot back",
+                )
+            elif isinstance(data, list):
+                await ch.edit(overwrites=_appliquer_ow(guild, data), reason="Watchdog: main bot back")
+            else:
+                await ch.set_permissions(guild.default_role, view_channel=True, reason="Watchdog: main bot back")
         except Exception as e:
             print(f"[WATCHDOG] restore #{getattr(ch, 'name', ch_id)}: {e}")
 
