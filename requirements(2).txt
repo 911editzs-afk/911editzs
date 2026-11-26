@@ -1,0 +1,12 @@
+discord.py>=2.5,<3
+aiohttp>=3.9
+pymongo>=4.6
+dnspython>=2.4
+matplotlib>=3.8
+tzdata
+audioop-lts; python_version >= "3.13"
+shazamio
+yt-dlp[default]
+spotipy
+pytube
+pycryptodome
