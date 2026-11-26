@@ -68,7 +68,7 @@ ROLE_BOOSTER_VC = 1540096120615866478
 
 CHECK_INTERVAL = 50
 FAILS_BEFORE_LOCK = 3
-HEARTBEAT_MAX_AGE = 150
+HEARTBEAT_MAX_AGE = 180
 
 
 def charger(nom: str) -> dict:
@@ -217,12 +217,6 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
         if ch.id in proteges:
             continue
         try:
-            if ch.id in SALONS_TOUJOURS_CACHES:
-                await ch.set_permissions(
-                    guild.default_role, view_channel=False,
-                    reason=f"Watchdog lockdown (always hidden): {raison}",
-                )
-                continue
             await ch.set_permissions(
                 guild.default_role, view_channel=False,
                 reason=f"Watchdog lockdown: {raison}",
@@ -349,6 +343,14 @@ async def prevenir_owner(guild: discord.Guild, raison: str):
 async def verif_look():
     global etat, _echec_consecutifs, _dernier_msg_id_vu
 
+    # Recharge /look depuis Mongo (au cas où)
+    try:
+        look_db = charger(FICHIER_LOOK)
+        if look_db.get("channel_id"):
+            LOOK.update(look_db)
+    except Exception:
+        pass
+
     channel_id = LOOK.get("channel_id")
     if not channel_id:
         etat = "pas de /look configuré"
@@ -368,7 +370,10 @@ async def verif_look():
         async for msg in channel.history(limit=5):
             contenu = (msg.content or "").strip()
             if contenu.replace(" ", "") == "la":
-                age = (datetime.now(timezone.utc) - msg.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                created = msg.created_at
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
                 if age < 0:
                     age = -age
                 if age <= HEARTBEAT_MAX_AGE:
