@@ -431,25 +431,34 @@ async def on_ready():
         await client.change_presence(status=discord.Status.offline)
     except Exception:
         pass
-    # Sync UNIQUEMENT par serveur (évite les commandes en double global+guild)
-    try:
-        # Efface d'éventuelles commandes globales (source des doublons)
-        tree.clear_commands(guild=None)
-        await tree.sync()  # push la liste vide en global
-        print("[WATCHDOG] Commandes globales effacées (anti-doublon)")
-    except Exception as e:
-        print(f"[WATCHDOG] clear global: {e}")
+
+    # 1) Commandes sur chaque serveur
     for g in client.guilds:
         try:
-            # Réinjecte les commandes du code sur ce serveur uniquement
-            for cmd in list(tree.get_commands()):
-                tree.add_command(cmd, guild=g, override=True)
+            tree.copy_global_to(guild=g)
             synced = await tree.sync(guild=g)
-            print(f"[WATCHDOG] {len(synced)} commande(s) sur {g.name}: {[c.name for c in synced]}")
+            print(f"[WATCHDOG] {len(synced)} cmd(s) on {g.name}: {[c.name for c in synced]}")
         except Exception as e:
             print(f"[WATCHDOG] sync {g.name}: {e}")
+
+    # 2) Enlever les commandes GLOBALES côté Discord (évite le doublon)
+    #    sans perdre les définitions locales
+    try:
+        saved = list(tree.get_commands())
+        tree.clear_commands(guild=None)
+        await tree.sync()
+        for cmd in saved:
+            try:
+                tree.add_command(cmd)
+            except Exception:
+                pass
+        print("[WATCHDOG] Commandes globales Discord effacées (1 seul /look par serveur)")
+    except Exception as e:
+        print(f"[WATCHDOG] clear global: {e}")
+
     if not verif_look.is_running():
         verif_look.start()
+
 
 
 async def principal():
