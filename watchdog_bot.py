@@ -55,7 +55,16 @@ except Exception as e:
 
 
 FICHIER_LOCKDOWN = "lockdown_config.json"
+FICHIER_SCAN_PERMS = "lockdown_permissions_scan.json"
 FICHIER_LOOK = "watchdog_look.json"
+
+SALONS_TOUJOURS_CACHES = {
+    1430894382923518074, 1572700047978791003, 1572698656077910027,
+    1484907833215549470, 1561015186926731284,
+}
+SALONS_BOOSTERS = {1549867572713881720, 1540071405197070356}
+ROLE_BOOSTER_VC = 1540096120615866478
+
 
 CHECK_INTERVAL = 50
 FAILS_BEFORE_LOCK = 3
@@ -188,7 +197,12 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
     if not cfg.get("status_channel_id") or cfg.get("locked"):
         return bool(cfg.get("locked"))
 
-    proteges = _ids_proteges(cfg)
+    proteges = set()
+    if cfg.get("status_channel_id"):
+        proteges.add(int(cfg["status_channel_id"]))
+    if cfg.get("rules_channel_id"):
+        proteges.add(int(cfg["rules_channel_id"]))
+
     status_ch = guild.get_channel(int(cfg["status_channel_id"]))
     if status_ch is None:
         try:
@@ -197,52 +211,36 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             print(f"[WATCHDOG] Status channel missing on {guild.name}")
             return False
 
-    snapshot = {}
-    hides = [int(x) for x in (cfg.get("hide_channel_ids") or [])]
-    for ch in guild.channels:
+    role_booster = guild.get_role(ROLE_BOOSTER_VC)
+
+    for ch in list(guild.channels):
         if ch.id in proteges:
             continue
-        if hides and ch.id not in hides:
-            continue
         try:
-            ev = ch.overwrites_for(guild.default_role).view_channel
-            snapshot[str(ch.id)] = {"everyone_view": ev, "overwrites": _serialiser_ow(ch)}
-        except Exception:
-            continue
-
-    # Liste explicite si configurée, sinon tous sauf protégés
-    hides = [int(x) for x in (cfg.get("hide_channel_ids") or [])]
-    cibles = []
-    for ch in guild.channels:
-        if ch.id in proteges:
-            continue
-        if hides and ch.id not in hides:
-            continue
-        cibles.append(ch)
-
-    for ch in cibles:
-        try:
-            # Ne pas écraser toutes les overwrites — seulement @everyone
+            if ch.id in SALONS_TOUJOURS_CACHES:
+                await ch.set_permissions(
+                    guild.default_role, view_channel=False,
+                    reason=f"Watchdog lockdown (always hidden): {raison}",
+                )
+                continue
             await ch.set_permissions(
-                guild.default_role,
-                view_channel=False,
+                guild.default_role, view_channel=False,
                 reason=f"Watchdog lockdown: {raison}",
             )
+            if role_booster is not None:
+                await ch.set_permissions(
+                    role_booster, view_channel=False,
+                    reason=f"Watchdog lockdown: hide booster role",
+                )
         except Exception as e:
             print(f"[WATCHDOG] hide #{getattr(ch, 'name', ch.id)}: {e}")
 
     try:
-        ow_status = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=True, send_messages=False, add_reactions=False,
-            ),
-        }
-        if me:
-            ow_status[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_messages=True,
-                embed_links=True, manage_channels=True,
-            )
-        await status_ch.edit(overwrites=ow_status, reason=f"Watchdog lockdown: {raison}")
+        await status_ch.set_permissions(
+            guild.default_role,
+            view_channel=True, send_messages=False, add_reactions=False,
+            reason=f"Watchdog lockdown: {raison}",
+        )
     except Exception as e:
         print(f"[WATCHDOG] status channel show: {e}")
 
@@ -259,47 +257,66 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
                 print(f"[WATCHDOG] rules visible: {e}")
 
     cfg["locked"] = True
-    cfg["snapshot"] = snapshot
     cfg["locked_at"] = datetime.now(timezone.utc).isoformat()
     cfg["locked_reason"] = raison
     return True
 
 
 async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
+    """Restaure depuis lockdown_permissions_scan.json (même fichier que /scan)."""
     if not cfg.get("locked"):
         return False
 
-    for ch_id, data in (cfg.get("snapshot") or {}).items():
-        ch = guild.get_channel(int(ch_id))
+    scan = charger(FICHIER_SCAN_PERMS)
+    channels = (scan or {}).get("channels") or {}
+    if not channels:
+        print("[WATCHDOG] Pas de scan — unlock partiel (view_channel=True partout sauf always-hidden)")
+        proteges = set()
+        if cfg.get("status_channel_id"):
+            proteges.add(int(cfg["status_channel_id"]))
+        for ch in guild.channels:
+            if ch.id in proteges or ch.id in SALONS_TOUJOURS_CACHES:
+                continue
+            try:
+                await ch.set_permissions(
+                    guild.default_role, view_channel=True,
+                    reason="Watchdog unlock (no scan)",
+                )
+            except Exception as e:
+                print(f"[WATCHDOG] unlock #{getattr(ch, 'name', ch.id)}: {e}")
+    else:
+        for cid, info in channels.items():
+            ch = guild.get_channel(int(cid))
+            if ch is None:
+                continue
+            try:
+                overwrites = _appliquer_ow(guild, info.get("overwrites") or [])
+                await ch.edit(overwrites=overwrites, reason="Watchdog: restore from /scan")
+            except Exception as e:
+                print(f"[WATCHDOG] restore #{info.get('name', cid)}: {e}")
+
+    for cid in SALONS_TOUJOURS_CACHES:
+        ch = guild.get_channel(cid)
         if ch is None:
             continue
         try:
-            if isinstance(data, dict) and "everyone_view" in data:
-                await ch.set_permissions(
-                    guild.default_role,
-                    view_channel=data.get("everyone_view"),
-                    reason="Watchdog: main bot back",
-                )
-            elif isinstance(data, list):
-                await ch.edit(overwrites=_appliquer_ow(guild, data), reason="Watchdog: main bot back")
-            else:
-                await ch.set_permissions(guild.default_role, view_channel=True, reason="Watchdog: main bot back")
-        except Exception as e:
-            print(f"[WATCHDOG] restore #{getattr(ch, 'name', ch_id)}: {e}")
+            await ch.set_permissions(
+                guild.default_role, view_channel=False,
+                reason="Watchdog: always hidden",
+            )
+        except Exception:
+            pass
 
+    # Cacher le salon statut (bot online)
     sid = cfg.get("status_channel_id")
     if sid:
         status_ch = guild.get_channel(int(sid))
         if status_ch is not None:
             try:
-                me = guild.me
-                ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-                if me:
-                    ow[me] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, manage_messages=True,
-                        manage_channels=True, embed_links=True,
-                    )
-                await status_ch.edit(overwrites=ow, reason="Watchdog: hide status (bot online)")
+                await status_ch.set_permissions(
+                    guild.default_role, view_channel=False,
+                    reason="Watchdog: hide status (bot online)",
+                )
             except Exception as e:
                 print(f"[WATCHDOG] hide status: {e}")
 
