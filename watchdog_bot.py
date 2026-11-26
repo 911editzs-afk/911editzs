@@ -1,34 +1,34 @@
 """
-Watchdog bot — surveille le bot principal via heartbeat partagé (MongoDB / JSON).
+Watchdog bot — reste TOUJOURS offline (invisible) sur Discord.
 
-Si le heartbeat du bot principal est trop vieux → active le lockdown
-(tous les salons cachés sauf le salon de statut configuré avec /setupoffline).
+Surveille un salon (commande /look) dans le serveur Notify Me.
+Le bot principal y écrit " la " chaque minute (/write).
 
-Quand le heartbeat revient → lève le lockdown.
+Si 3 lectures de suite sans nouveau message → lockdown du serveur principal
+(tous les salons cachés sauf règles + salon statut).
+Quand un nouveau heartbeat apparaît → unlock.
 
-Variables d'environnement requises :
-  DISCORD_TOKEN_WATCHDOG  (ou DISCORD_TOKEN)  → token du DEUXIÈME bot
-  MONGODB_URI             (optionnel, même que le bot principal si tu l'utilises)
-  PORT                    (Render Web Service)
+Le propriétaire du serveur principal reçoit un message privé si le lockdown
+se déclenche.
 
-Déploie ce fichier comme un SECOND service Render (Web Service),
-dans le même repo ou un repo séparé, avec le même storage / MongoDB.
+Variables d'environnement :
+  DISCORD_TOKEN_WATCHDOG  (ou DISCORD_TOKEN) — token de CE bot
+  MONGODB_URI             — même que le bot principal (partage lockdown_config)
+  PORT                    — Render
 """
 
 import asyncio
 import json
 import os
 import signal
-import time
 import traceback
 from datetime import datetime, timezone
 
-import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import tasks
 
 
-# ---------- ENV ----------
 def charger_env():
     for nom in ("DISCORD_TOKEN.env", ".env"):
         if not os.path.exists(nom):
@@ -43,36 +43,23 @@ def charger_env():
 
 charger_env()
 
-# Token du WATCHDOG (différent du bot principal !)
 TOKEN = os.getenv("DISCORD_TOKEN_WATCHDOG") or os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("[WATCHDOG] DISCORD_TOKEN_WATCHDOG (ou DISCORD_TOKEN) manquant.")
 
-# Même stockage que le bot principal
 try:
     import storage
 except Exception as e:
     storage = None
-    print(f"[WATCHDOG] storage non chargé ({e}) → fallback fichiers JSON locaux.")
+    print(f"[WATCHDOG] storage non chargé ({e}) → fichiers JSON locaux.")
 
 
-FICHIER_HEARTBEAT = "bot_heartbeat.json"
 FICHIER_LOCKDOWN = "lockdown_config.json"
+FICHIER_LOOK = "watchdog_look.json"
 
-# Si le dernier heartbeat a plus de X secondes → considéré offline
-HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "180"))  # 3 minutes
-CHECK_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "30"))       # vérifie toutes les 30 s
-
-MESSAGE_OFFLINE_DEFAUT = (
-    "# 🔴 The Peak bot is offline\n\n"
-    "The bot temporarily lost connection.\n"
-    "All channels are hidden for safety until it comes back online.\n\n"
-    "Please wait — everything will be restored automatically."
-)
-MESSAGE_ONLINE_DEFAUT = (
-    "# 🟢 The Peak bot is back online\n\n"
-    "All channels have been restored. You can use the server normally again."
-)
+CHECK_INTERVAL = 50
+FAILS_BEFORE_LOCK = 3
+HEARTBEAT_MAX_AGE = 150
 
 
 def charger(nom: str) -> dict:
@@ -81,10 +68,9 @@ def charger(nom: str) -> dict:
             data = storage.charger(nom)
             return data if isinstance(data, dict) else {}
         except Exception as e:
-            print(f"[WATCHDOG] storage.charger({nom}) : {e}")
-    chemin = nom if nom.endswith(".json") else nom + ".json"
+            print(f"[WATCHDOG] storage.charger({nom}): {e}")
     try:
-        with open(chemin, "r", encoding="utf-8") as f:
+        with open(nom, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
@@ -97,24 +83,36 @@ def sauver(nom: str, data: dict):
             storage.sauver(nom, data)
             return
         except Exception as e:
-            print(f"[WATCHDOG] storage.sauver({nom}) : {e}")
-    chemin = nom if nom.endswith(".json") else nom + ".json"
-    with open(chemin, "w", encoding="utf-8") as f:
+            print(f"[WATCHDOG] storage.sauver({nom}): {e}")
+    with open(nom, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ---------- DISCORD CLIENT ----------
 intents = discord.Intents.default()
 intents.guilds = True
+intents.message_content = True
 
-client = discord.Client(
-    intents=intents,
-    status=discord.Status.online,
-    activity=discord.CustomActivity(name="Watching main bot"),
-)
+
+class Watchdog(discord.Client):
+    def __init__(self):
+        super().__init__(
+            intents=intents,
+            status=discord.Status.offline,
+        )
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await demarrer_serveur_web()
+
+
+client = Watchdog()
+tree = client.tree
 
 _web_demarre = False
 etat = "démarrage…"
+_echec_consecutifs = 0
+_dernier_msg_id_vu = None
+LOOK = charger(FICHIER_LOOK)
 
 
 async def demarrer_serveur_web():
@@ -126,13 +124,14 @@ async def demarrer_serveur_web():
     from aiohttp import web
 
     async def ok(_request):
-        hb = charger(FICHIER_HEARTBEAT)
-        age = "?"
-        if hb.get("ts"):
-            age = f"{int(time.time() - float(hb['ts']))}s ago"
         ready = "oui" if client.is_ready() else "non"
+        look = LOOK.get("channel_id", "?")
         return web.Response(
-            text=f"Watchdog OK\nDiscord ready: {ready}\nLast main heartbeat: {age}\nState: {etat}"
+            text=(
+                f"Watchdog OK (status=offline)\nDiscord ready: {ready}\n"
+                f"Looking at channel: {look}\nFails: {_echec_consecutifs}/{FAILS_BEFORE_LOCK}\n"
+                f"State: {etat}"
+            )
         )
 
     app = web.Application()
@@ -141,10 +140,9 @@ async def demarrer_serveur_web():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
-    print(f"[WATCHDOG] Serveur web sur le port {port}")
+    print(f"[WATCHDOG] Web server on port {port}")
 
 
-# ---------- LOCKDOWN (copie légère de la logique du bot principal) ----------
 def _serialiser_ow(channel) -> list:
     out = []
     for target, ow in channel.overwrites.items():
@@ -164,10 +162,7 @@ def _serialiser_ow(channel) -> list:
 def _appliquer_ow(guild, data_list: list) -> dict:
     overwrites = {}
     for item in data_list or []:
-        if item.get("type") == "role":
-            target = guild.get_role(item["id"])
-        else:
-            target = guild.get_member(item["id"])
+        target = guild.get_role(item["id"]) if item.get("type") == "role" else guild.get_member(item["id"])
         if target is None:
             continue
         try:
@@ -180,23 +175,31 @@ def _appliquer_ow(guild, data_list: list) -> dict:
     return overwrites
 
 
-async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool:
-    if not cfg.get("status_channel_id"):
-        return False
-    if cfg.get("locked"):
-        return True
+def _ids_proteges(cfg: dict) -> set:
+    ids = set()
+    if cfg.get("status_channel_id"):
+        ids.add(int(cfg["status_channel_id"]))
+    if cfg.get("rules_channel_id"):
+        ids.add(int(cfg["rules_channel_id"]))
+    return ids
 
+
+async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool:
+    if not cfg.get("status_channel_id") or cfg.get("locked"):
+        return bool(cfg.get("locked"))
+
+    proteges = _ids_proteges(cfg)
     status_ch = guild.get_channel(int(cfg["status_channel_id"]))
     if status_ch is None:
         try:
             status_ch = await guild.fetch_channel(int(cfg["status_channel_id"]))
         except Exception:
-            print(f"[WATCHDOG] Salon statut introuvable sur {guild.name}")
+            print(f"[WATCHDOG] Status channel missing on {guild.name}")
             return False
 
     snapshot = {}
     for ch in guild.channels:
-        if ch.id == status_ch.id:
+        if ch.id in proteges:
             continue
         try:
             snapshot[str(ch.id)] = _serialiser_ow(ch)
@@ -205,7 +208,7 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
 
     me = guild.me
     for ch in list(guild.channels):
-        if ch.id == status_ch.id:
+        if ch.id in proteges:
             continue
         try:
             ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
@@ -216,7 +219,7 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
                 )
             await ch.edit(overwrites=ow, reason=f"Watchdog lockdown: {raison}")
         except Exception as e:
-            print(f"[WATCHDOG] Impossible de cacher #{getattr(ch, 'name', ch.id)}: {e}")
+            print(f"[WATCHDOG] hide #{getattr(ch, 'name', ch.id)}: {e}")
 
     try:
         ow_status = {
@@ -231,25 +234,19 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             )
         await status_ch.edit(overwrites=ow_status, reason=f"Watchdog lockdown: {raison}")
     except Exception as e:
-        print(f"[WATCHDOG] Config salon statut : {e}")
+        print(f"[WATCHDOG] status channel show: {e}")
 
-    texte = cfg.get("message_offline") or MESSAGE_OFFLINE_DEFAUT
-    embed = discord.Embed(description=texte, color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Reason: {raison}")
-    try:
-        msg_id = cfg.get("status_msg_id")
-        if msg_id:
+    rid = cfg.get("rules_channel_id")
+    if rid:
+        rules_ch = guild.get_channel(int(rid))
+        if rules_ch is not None:
             try:
-                msg = await status_ch.fetch_message(int(msg_id))
-                await msg.edit(content=None, embed=embed)
-            except Exception:
-                msg = await status_ch.send(embed=embed)
-                cfg["status_msg_id"] = msg.id
-        else:
-            msg = await status_ch.send(embed=embed)
-            cfg["status_msg_id"] = msg.id
-    except Exception as e:
-        print(f"[WATCHDOG] Message offline : {e}")
+                await rules_ch.set_permissions(
+                    guild.default_role, view_channel=True,
+                    reason="Watchdog: keep rules visible",
+                )
+            except Exception as e:
+                print(f"[WATCHDOG] rules visible: {e}")
 
     cfg["locked"] = True
     cfg["snapshot"] = snapshot
@@ -262,35 +259,30 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
     if not cfg.get("locked"):
         return False
 
-    snapshot = cfg.get("snapshot") or {}
-    for ch_id, ow_data in snapshot.items():
+    for ch_id, ow_data in (cfg.get("snapshot") or {}).items():
         ch = guild.get_channel(int(ch_id))
         if ch is None:
             continue
         try:
-            await ch.edit(overwrites=_appliquer_ow(guild, ow_data), reason="Watchdog: main bot back online")
+            await ch.edit(overwrites=_appliquer_ow(guild, ow_data), reason="Watchdog: main bot back")
         except Exception as e:
-            print(f"[WATCHDOG] Restauration #{getattr(ch, 'name', ch_id)}: {e}")
+            print(f"[WATCHDOG] restore #{getattr(ch, 'name', ch_id)}: {e}")
 
-    status_id = cfg.get("status_channel_id")
-    status_ch = guild.get_channel(int(status_id)) if status_id else None
-    if status_ch is not None:
-        texte = cfg.get("message_online") or MESSAGE_ONLINE_DEFAUT
-        embed = discord.Embed(description=texte, color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-        try:
-            msg_id = cfg.get("status_msg_id")
-            if msg_id:
-                try:
-                    msg = await status_ch.fetch_message(int(msg_id))
-                    await msg.edit(content=None, embed=embed)
-                except Exception:
-                    msg = await status_ch.send(embed=embed)
-                    cfg["status_msg_id"] = msg.id
-            else:
-                msg = await status_ch.send(embed=embed)
-                cfg["status_msg_id"] = msg.id
-        except Exception as e:
-            print(f"[WATCHDOG] Message online : {e}")
+    sid = cfg.get("status_channel_id")
+    if sid:
+        status_ch = guild.get_channel(int(sid))
+        if status_ch is not None:
+            try:
+                me = guild.me
+                ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+                if me:
+                    ow[me] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, manage_messages=True,
+                        manage_channels=True, embed_links=True,
+                    )
+                await status_ch.edit(overwrites=ow, reason="Watchdog: hide status (bot online)")
+            except Exception as e:
+                print(f"[WATCHDOG] hide status: {e}")
 
     cfg["locked"] = False
     cfg["snapshot"] = {}
@@ -299,71 +291,160 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
     return True
 
 
-# ---------- BOUCLE DE SURVEILLANCE ----------
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def verif_heartbeat():
-    global etat
+async def prevenir_owner(guild: discord.Guild, raison: str):
     try:
-        hb = charger(FICHIER_HEARTBEAT)
-        ts = float(hb.get("ts") or 0)
-        age = time.time() - ts if ts else 999999
-        principal_online = age < HEARTBEAT_TIMEOUT
-
-        lockdown_all = charger(FICHIER_LOCKDOWN)
-        modifie = False
-
-        for guild in client.guilds:
-            gid = str(guild.id)
-            cfg = lockdown_all.get(gid)
-            if not cfg or not cfg.get("enabled") or not cfg.get("status_channel_id"):
-                continue
-
-            if not principal_online and not cfg.get("locked"):
-                print(f"[WATCHDOG] Main bot offline (heartbeat {int(age)}s) → lockdown sur {guild.name}")
-                if await activer_lockdown(guild, cfg, f"Main bot offline (no heartbeat for {int(age)}s)"):
-                    lockdown_all[gid] = cfg
-                    modifie = True
-                    etat = f"LOCKDOWN actif (heartbeat age={int(age)}s)"
-
-            elif principal_online and cfg.get("locked"):
-                # Ne lever le lockdown que si c'est le watchdog qui l'avait mis
-                # (ou toujours : le principal est revenu)
-                print(f"[WATCHDOG] Main bot online → unlock sur {guild.name}")
-                if await desactiver_lockdown(guild, cfg):
-                    lockdown_all[gid] = cfg
-                    modifie = True
-                    etat = f"OK — main bot online (heartbeat {int(age)}s ago)"
-
-            elif principal_online:
-                etat = f"OK — main bot online (heartbeat {int(age)}s ago)"
-            else:
-                etat = f"LOCKDOWN — main offline (heartbeat {int(age)}s ago)"
-
-        if modifie:
-            sauver(FICHIER_LOCKDOWN, lockdown_all)
-
+        owner = guild.owner
+        if owner is None:
+            owner = await guild.fetch_member(guild.owner_id)
+        if owner is None:
+            return
+        await owner.send(
+            f"🚨 **Watchdog alert** on **{guild.name}**\n"
+            f"The main bot seems offline.\n"
+            f"**Action:** lockdown activated (only rules + status channel visible).\n"
+            f"**Reason:** {raison}\n"
+            f"Channels will be restored automatically when the main bot writes again."
+        )
     except Exception as e:
-        print(f"[WATCHDOG] Erreur verif : {e!r}")
-        traceback.print_exc()
+        print(f"[WATCHDOG] Impossible de DM le owner : {e}")
 
 
-@verif_heartbeat.before_loop
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def verif_look():
+    global etat, _echec_consecutifs, _dernier_msg_id_vu
+
+    channel_id = LOOK.get("channel_id")
+    if not channel_id:
+        etat = "pas de /look configuré"
+        return
+
+    channel = client.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(int(channel_id))
+        except Exception as e:
+            print(f"[WATCHDOG] Salon /look introuvable : {e}")
+            etat = f"salon introuvable: {e}"
+            return
+
+    heartbeat_ok = False
+    try:
+        async for msg in channel.history(limit=5):
+            contenu = (msg.content or "").strip()
+            if contenu.replace(" ", "") == "la":
+                age = (datetime.now(timezone.utc) - msg.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                if age < 0:
+                    age = -age
+                if age <= HEARTBEAT_MAX_AGE:
+                    heartbeat_ok = True
+                    _dernier_msg_id_vu = msg.id
+                    break
+    except Exception as e:
+        print(f"[WATCHDOG] Lecture history : {e}")
+        etat = f"erreur lecture: {e}"
+        return
+
+    lockdown_all = charger(FICHIER_LOCKDOWN)
+    modifie = False
+
+    if heartbeat_ok:
+        _echec_consecutifs = 0
+        etat = f"OK — heartbeat vu (msg {_dernier_msg_id_vu})"
+        for guild in client.guilds:
+            cfg = lockdown_all.get(str(guild.id))
+            if cfg and cfg.get("enabled") and cfg.get("locked"):
+                if await desactiver_lockdown(guild, cfg):
+                    lockdown_all[str(guild.id)] = cfg
+                    modifie = True
+                    print(f"[WATCHDOG] Unlock {guild.name}")
+    else:
+        _echec_consecutifs += 1
+        etat = f"pas de heartbeat ({_echec_consecutifs}/{FAILS_BEFORE_LOCK})"
+        print(f"[WATCHDOG] {etat}")
+
+        if _echec_consecutifs >= FAILS_BEFORE_LOCK:
+            for guild in client.guilds:
+                cfg = lockdown_all.get(str(guild.id))
+                if not cfg or not cfg.get("enabled") or cfg.get("locked"):
+                    continue
+                raison = f"No heartbeat for {_echec_consecutifs} checks (~{_echec_consecutifs * CHECK_INTERVAL}s)"
+                if await activer_lockdown(guild, cfg, raison):
+                    lockdown_all[str(guild.id)] = cfg
+                    modifie = True
+                    print(f"[WATCHDOG] LOCKDOWN {guild.name}")
+                    await prevenir_owner(guild, raison)
+
+    if modifie:
+        sauver(FICHIER_LOCKDOWN, lockdown_all)
+
+
+@verif_look.before_loop
 async def _avant_verif():
     await client.wait_until_ready()
 
 
+@tree.command(
+    name="look",
+    description="Channel to watch for the main bot heartbeat (same as /write on main bot)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="The heartbeat channel in the Notify Me server")
+async def look_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Administrators only.", ephemeral=True)
+        return
+    LOOK["channel_id"] = channel.id
+    LOOK["guild_id"] = interaction.guild.id
+    sauver(FICHIER_LOOK, LOOK)
+    global _echec_consecutifs
+    _echec_consecutifs = 0
+    await interaction.response.send_message(
+        f"✅ Watching {channel.mention} every **{CHECK_INTERVAL}s**.\n"
+        f"After **{FAILS_BEFORE_LOCK}** empty checks → lockdown on the main server.\n"
+        f"Main bot must use `/write` on this same channel.",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="watchstatus",
+    description="Show watchdog status",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def watchstatus_cmd(interaction: discord.Interaction):
+    ch = f"<#{LOOK['channel_id']}>" if LOOK.get("channel_id") else "_not set_"
+    await interaction.response.send_message(
+        f"**Watchdog** (always offline on Discord)\n"
+        f"Looking at: {ch}\n"
+        f"Fails: **{_echec_consecutifs}** / {FAILS_BEFORE_LOCK}\n"
+        f"State: {etat}",
+        ephemeral=True,
+    )
+
+
 @client.event
 async def on_ready():
-    print(f"[WATCHDOG] Connecté en tant que {client.user} | {len(client.guilds)} serveur(s)")
-    if not verif_heartbeat.is_running():
-        verif_heartbeat.start()
+    print(f"[WATCHDOG] Ready as {client.user} (status=offline) | {len(client.guilds)} guild(s)")
+    try:
+        await client.change_presence(status=discord.Status.offline)
+    except Exception:
+        pass
+    for g in client.guilds:
+        try:
+            await tree.sync(guild=g)
+        except Exception as e:
+            print(f"[WATCHDOG] sync {g.name}: {e}")
+    if not verif_look.is_running():
+        verif_look.start()
 
 
 async def principal():
     await demarrer_serveur_web()
 
     def _stop(signum, frame):
-        print(f"[WATCHDOG] Signal {signum} — arrêt")
+        print(f"[WATCHDOG] signal {signum}")
         raise SystemExit(0)
 
     try:
@@ -376,7 +457,7 @@ async def principal():
         async with client:
             await client.start(TOKEN)
     except Exception as e:
-        print(f"[WATCHDOG] Erreur : {e!r}")
+        print(f"[WATCHDOG] {e!r}")
         traceback.print_exc()
         await asyncio.sleep(60)
         raise SystemExit(1)
