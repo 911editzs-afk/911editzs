@@ -194,14 +194,9 @@ def _ids_proteges(cfg: dict) -> set:
 
 
 async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool:
+    """Cache uniquement les salons mode=lockdown du scan MongoDB."""
     if not cfg.get("status_channel_id") or cfg.get("locked"):
         return bool(cfg.get("locked"))
-
-    proteges = set()
-    if cfg.get("status_channel_id"):
-        proteges.add(int(cfg["status_channel_id"]))
-    if cfg.get("rules_channel_id"):
-        proteges.add(int(cfg["rules_channel_id"]))
 
     status_ch = guild.get_channel(int(cfg["status_channel_id"]))
     if status_ch is None:
@@ -211,24 +206,34 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             print(f"[WATCHDOG] Status channel missing on {guild.name}")
             return False
 
-    role_booster = guild.get_role(ROLE_BOOSTER_VC)
+    scan = charger(FICHIER_SCAN_PERMS)
+    channels = (scan or {}).get("channels") or {}
+    if not channels:
+        print("[WATCHDOG] Pas de scan — impossible de lock proprement")
+        return False
 
-    for ch in list(guild.channels):
-        if ch.id in proteges:
+    role_booster = guild.get_role(ROLE_BOOSTER_VC)
+    n = 0
+    for cid, info in channels.items():
+        if info.get("mode") != "lockdown":
+            continue
+        ch = guild.get_channel(int(cid))
+        if ch is None:
             continue
         try:
             await ch.set_permissions(
                 guild.default_role, view_channel=False,
                 reason=f"Watchdog lockdown: {raison}",
             )
-            # Uniquement sur les salons boosters : deny le rôle booster
-            if ch.id in SALONS_BOOSTERS and role_booster is not None:
+            if int(cid) in SALONS_BOOSTERS and role_booster is not None:
                 await ch.set_permissions(
                     role_booster, view_channel=False,
-                    reason=f"Watchdog lockdown: hide booster channels only",
+                    reason=f"Watchdog lockdown: booster channel",
                 )
+            n += 1
+            await asyncio.sleep(0.25)
         except Exception as e:
-            print(f"[WATCHDOG] hide #{getattr(ch, 'name', ch.id)}: {e}")
+            print(f"[WATCHDOG] hide #{info.get('name', cid)}: {e}")
 
     try:
         await status_ch.set_permissions(
@@ -237,7 +242,7 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             reason=f"Watchdog lockdown: {raison}",
         )
     except Exception as e:
-        print(f"[WATCHDOG] status channel show: {e}")
+        print(f"[WATCHDOG] status: {e}")
 
     rid = cfg.get("rules_channel_id")
     if rid:
@@ -246,61 +251,48 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             try:
                 await rules_ch.set_permissions(
                     guild.default_role, view_channel=True,
-                    reason="Watchdog: keep rules visible",
+                    reason="Watchdog: rules visible",
                 )
-            except Exception as e:
-                print(f"[WATCHDOG] rules visible: {e}")
+            except Exception:
+                pass
 
     cfg["locked"] = True
     cfg["locked_at"] = datetime.now(timezone.utc).isoformat()
     cfg["locked_reason"] = raison
+    print(f"[WATCHDOG] LOCKDOWN {guild.name} — {n} salons")
     return True
 
 
 async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
-    """Restaure depuis lockdown_permissions_scan.json (même fichier que /scan)."""
+    """Restaure les overwrites des salons mode=lockdown depuis le scan."""
     if not cfg.get("locked"):
         return False
 
     scan = charger(FICHIER_SCAN_PERMS)
     channels = (scan or {}).get("channels") or {}
     if not channels:
-        print("[WATCHDOG] Pas de scan — unlock partiel (view_channel=True partout sauf always-hidden)")
-        proteges = set()
-        if cfg.get("status_channel_id"):
-            proteges.add(int(cfg["status_channel_id"]))
-        for ch in guild.channels:
-            if ch.id in proteges or ch.id in SALONS_TOUJOURS_CACHES:
-                continue
-            try:
-                await ch.set_permissions(
-                    guild.default_role, view_channel=True,
-                    reason="Watchdog unlock (no scan)",
-                )
-            except Exception as e:
-                print(f"[WATCHDOG] unlock #{getattr(ch, 'name', ch.id)}: {e}")
-    else:
-        for cid, info in channels.items():
-            ch = guild.get_channel(int(cid))
-            if ch is None:
-                continue
-            try:
-                overwrites = _appliquer_ow(guild, info.get("overwrites") or [])
-                await ch.edit(overwrites=overwrites, reason="Watchdog: restore from /scan")
-            except Exception as e:
-                print(f"[WATCHDOG] restore #{info.get('name', cid)}: {e}")
+        print("[WATCHDOG] Pas de scan — unlock impossible proprement")
+        return False
 
-    for cid in SALONS_TOUJOURS_CACHES:
-        ch = guild.get_channel(cid)
+    for cid, info in channels.items():
+        if info.get("mode") != "lockdown":
+            continue
+        ch = guild.get_channel(int(cid))
         if ch is None:
             continue
         try:
-            await ch.set_permissions(
-                guild.default_role, view_channel=False,
-                reason="Watchdog: always hidden",
-            )
-        except Exception:
-            pass
+            overwrites = _appliquer_ow(guild, info.get("overwrites") or [])
+            await ch.edit(overwrites=overwrites, reason="Watchdog: restore from /scan")
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            print(f"[WATCHDOG] restore #{info.get('name', cid)}: {e}")
+            try:
+                await ch.set_permissions(
+                    guild.default_role, view_channel=True,
+                    reason="Watchdog unlock fallback",
+                )
+            except Exception:
+                pass
 
     # Cacher le salon statut (bot online)
     sid = cfg.get("status_channel_id")
@@ -319,6 +311,7 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
     cfg["snapshot"] = {}
     cfg.pop("locked_at", None)
     cfg.pop("locked_reason", None)
+    print(f"[WATCHDOG] Unlock {guild.name}")
     return True
 
 
