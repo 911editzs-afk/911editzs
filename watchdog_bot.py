@@ -322,6 +322,40 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
         except Exception as e:
             print(f"[WATCHDOG] restore #{info.get('name', cid)}: {e}")
 
+    # Tickets (créés en continu par le bot principal, enregistrés dans le scan avec
+    # mode="ticket") : on remet leurs permissions privées comme à la création et on
+    # force @everyone en view_channel=False. Restauration NON destructive : on ne
+    # remplace jamais tous les overwrites, donc le propriétaire du ticket garde l'accès.
+    for cid, info in channels.items():
+        if info.get("mode") != "ticket":
+            continue
+        ch = guild.get_channel(int(cid))
+        if ch is None:
+            continue  # ticket supprimé, rien à faire
+        try:
+            for item in info.get("overwrites") or []:
+                if item.get("type") != "role":
+                    continue  # pas d'intent members ici : les membres ne sont jamais modifiés
+                target = guild.get_role(int(item["id"]))
+                if target is None or target.is_default():
+                    continue
+                await ch.set_permissions(
+                    target,
+                    overwrite=discord.PermissionOverwrite.from_pair(
+                        discord.Permissions(item.get("allow", 0)),
+                        discord.Permissions(item.get("deny", 0)),
+                    ),
+                    reason="Watchdog: restore ticket permissions",
+                )
+            if ch.overwrites_for(guild.default_role).view_channel is not False:
+                await ch.set_permissions(
+                    guild.default_role, view_channel=False,
+                    reason="Watchdog: ticket must stay private",
+                )
+            await asyncio.sleep(0.12)
+        except Exception as e:
+            print(f"[WATCHDOG] ticket #{info.get('name', cid)}: {e}")
+
     sid = cfg.get("status_channel_id")
     if sid and lock_role is not None:
         status_ch = guild.get_channel(int(sid))
