@@ -1,7 +1,7 @@
 """
 Watchdog bot — reste TOUJOURS offline (invisible) sur Discord.
 
-Surveille un salon (commande /look) dans le serveur Notify Me.
+Surveille un salon (commande /watch) dans le serveur Notify Me.
 Le bot principal y écrit " la " chaque minute (/write).
 
 Si 3 lectures de suite sans nouveau message → lockdown du serveur principal
@@ -315,7 +315,7 @@ async def verif_look():
 
     channel_id = LOOK.get("channel_id")
     if not channel_id:
-        etat = "pas de /look configuré"
+        etat = "pas de /watch configuré"
         return
 
     channel = client.get_channel(int(channel_id))
@@ -323,7 +323,7 @@ async def verif_look():
         try:
             channel = await client.fetch_channel(int(channel_id))
         except Exception as e:
-            print(f"[WATCHDOG] Salon /look introuvable : {e}")
+            print(f"[WATCHDOG] Salon /watch introuvable : {e}")
             etat = f"salon introuvable: {e}"
             return
 
@@ -384,13 +384,13 @@ async def _avant_verif():
 
 
 @tree.command(
-    name="look",
+    name="watch",
     description="Channel to watch for the main bot heartbeat (same as /write on main bot)",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="The heartbeat channel in the Notify Me server")
-async def look_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+async def watch_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Administrators only.", ephemeral=True)
         return
