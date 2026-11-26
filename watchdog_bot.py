@@ -1,7 +1,7 @@
 """
 Watchdog bot — reste TOUJOURS offline (invisible) sur Discord.
 
-Surveille un salon (commande /watch) dans le serveur Notify Me.
+Surveille un salon (commande /look) dans le serveur Notify Me.
 Le bot principal y écrit " la " chaque minute (/write).
 
 Si 3 lectures de suite sans nouveau message → lockdown du serveur principal
@@ -315,7 +315,7 @@ async def verif_look():
 
     channel_id = LOOK.get("channel_id")
     if not channel_id:
-        etat = "pas de /watch configuré"
+        etat = "pas de /look configuré"
         return
 
     channel = client.get_channel(int(channel_id))
@@ -323,7 +323,7 @@ async def verif_look():
         try:
             channel = await client.fetch_channel(int(channel_id))
         except Exception as e:
-            print(f"[WATCHDOG] Salon /watch introuvable : {e}")
+            print(f"[WATCHDOG] Salon /look introuvable : {e}")
             etat = f"salon introuvable: {e}"
             return
 
@@ -384,13 +384,13 @@ async def _avant_verif():
 
 
 @tree.command(
-    name="watch",
+    name="look",
     description="Channel to watch for the main bot heartbeat (same as /write on main bot)",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="The heartbeat channel in the Notify Me server")
-async def watch_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+async def look_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Administrators only.", ephemeral=True)
         return
@@ -431,9 +431,17 @@ async def on_ready():
         await client.change_presence(status=discord.Status.offline)
     except Exception:
         pass
+    # Enregistre les commandes slash sur chaque serveur + globalement
+    try:
+        synced_global = await tree.sync()
+        print(f"[WATCHDOG] {len(synced_global)} commande(s) globale(s) synchronisée(s)")
+    except Exception as e:
+        print(f"[WATCHDOG] sync global: {e}")
     for g in client.guilds:
         try:
-            await tree.sync(guild=g)
+            tree.copy_global_to(guild=g)
+            synced = await tree.sync(guild=g)
+            print(f"[WATCHDOG] {len(synced)} commande(s) sur {g.name}: {[c.name for c in synced]}")
         except Exception as e:
             print(f"[WATCHDOG] sync {g.name}: {e}")
     if not verif_look.is_running():
