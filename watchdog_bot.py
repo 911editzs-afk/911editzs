@@ -64,6 +64,7 @@ SALONS_TOUJOURS_CACHES = {
 }
 SALONS_BOOSTERS = {1549867572713881720, 1540071405197070356}
 ROLE_BOOSTER_VC = 1540096120615866478
+LOCKDOWN_MEMBER_ROLE_ID = 1397316935103942696  # PAS @everyone
 
 
 CHECK_INTERVAL = 50
@@ -194,7 +195,7 @@ def _ids_proteges(cfg: dict) -> set:
 
 
 async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool:
-    """Cache uniquement les salons mode=lockdown du scan MongoDB."""
+    """Cache salons mode=lockdown via rôle 1397316935103942696 — JAMAIS @everyone."""
     if not cfg.get("status_channel_id") or cfg.get("locked"):
         return bool(cfg.get("locked"))
 
@@ -206,13 +207,19 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             print(f"[WATCHDOG] Status channel missing on {guild.name}")
             return False
 
+    lock_role = guild.get_role(int(cfg.get("lock_role_id") or LOCKDOWN_MEMBER_ROLE_ID))
+    if lock_role is None or lock_role.is_default():
+        lock_role = guild.get_role(LOCKDOWN_MEMBER_ROLE_ID)
+    if lock_role is None or lock_role.is_default():
+        print("[WATCHDOG] Rôle lockdown introuvable ou @everyone interdit")
+        return False
+
     scan = charger(FICHIER_SCAN_PERMS)
     channels = (scan or {}).get("channels") or {}
     if not channels:
-        print("[WATCHDOG] Pas de scan — impossible de lock proprement")
+        print("[WATCHDOG] Pas de scan — impossible de lock")
         return False
 
-    role_booster = guild.get_role(ROLE_BOOSTER_VC)
     n = 0
     for cid, info in channels.items():
         if info.get("mode") != "lockdown":
@@ -222,24 +229,21 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
             continue
         try:
             await ch.set_permissions(
-                guild.default_role, view_channel=False,
+                lock_role,
+                view_channel=False,
                 reason=f"Watchdog lockdown: {raison}",
             )
-            if int(cid) in SALONS_BOOSTERS and role_booster is not None:
-                await ch.set_permissions(
-                    role_booster, view_channel=False,
-                    reason=f"Watchdog lockdown: booster channel",
-                )
             n += 1
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.12)
         except Exception as e:
             print(f"[WATCHDOG] hide #{info.get('name', cid)}: {e}")
 
     try:
         await status_ch.set_permissions(
-            guild.default_role,
-            view_channel=True, send_messages=False, add_reactions=False,
-            reason=f"Watchdog lockdown: {raison}",
+            lock_role,
+            view_channel=True,
+            send_messages=False,
+            reason=f"Watchdog lockdown status: {raison}",
         )
     except Exception as e:
         print(f"[WATCHDOG] status: {e}")
@@ -250,7 +254,7 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
         if rules_ch is not None:
             try:
                 await rules_ch.set_permissions(
-                    guild.default_role, view_channel=True,
+                    lock_role, view_channel=True,
                     reason="Watchdog: rules visible",
                 )
             except Exception:
@@ -259,19 +263,23 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
     cfg["locked"] = True
     cfg["locked_at"] = datetime.now(timezone.utc).isoformat()
     cfg["locked_reason"] = raison
-    print(f"[WATCHDOG] LOCKDOWN {guild.name} — {n} salons")
+    print(f"[WATCHDOG] LOCKDOWN {guild.name} — {n} salons via {lock_role.name}")
     return True
 
 
 async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
-    """Restaure les overwrites des salons mode=lockdown depuis le scan."""
+    """Restaure les salons lockdown depuis le scan (overwrites). Nettoie le deny du rôle membre."""
     if not cfg.get("locked"):
         return False
+
+    lock_role = guild.get_role(int(cfg.get("lock_role_id") or LOCKDOWN_MEMBER_ROLE_ID))
+    if lock_role is not None and lock_role.is_default():
+        lock_role = None
 
     scan = charger(FICHIER_SCAN_PERMS)
     channels = (scan or {}).get("channels") or {}
     if not channels:
-        print("[WATCHDOG] Pas de scan — unlock impossible proprement")
+        print("[WATCHDOG] Pas de scan — unlock impossible")
         return False
 
     for cid, info in channels.items():
@@ -282,26 +290,45 @@ async def desactiver_lockdown(guild: discord.Guild, cfg: dict) -> bool:
             continue
         try:
             overwrites = _appliquer_ow(guild, info.get("overwrites") or [])
-            await ch.edit(overwrites=overwrites, reason="Watchdog: restore from /scan")
-            await asyncio.sleep(0.25)
+            # Ne jamais écrire @everyone depuis un overwrite corrompu : on filtre
+            overwrites = {k: v for k, v in overwrites.items() if k != guild.default_role}
+            if overwrites:
+                # merge: apply role overwrites from scan without wiping @everyone
+                for target, ow in overwrites.items():
+                    if target == guild.default_role:
+                        continue
+                    await ch.set_permissions(target, overwrite=ow, reason="Watchdog: restore from scan")
+            # clear lockdown deny on member role if scan had no special deny
+            if lock_role is not None:
+                found = False
+                for item in info.get("overwrites") or []:
+                    if item.get("type") == "role" and int(item.get("id", 0)) == lock_role.id:
+                        found = True
+                        await ch.set_permissions(
+                            lock_role,
+                            overwrite=discord.PermissionOverwrite.from_pair(
+                                discord.Permissions(item.get("allow", 0)),
+                                discord.Permissions(item.get("deny", 0)),
+                            ),
+                            reason="Watchdog: restore lock role from scan",
+                        )
+                        break
+                if not found:
+                    await ch.set_permissions(
+                        lock_role, overwrite=None,
+                        reason="Watchdog: clear lockdown deny",
+                    )
+            await asyncio.sleep(0.12)
         except Exception as e:
             print(f"[WATCHDOG] restore #{info.get('name', cid)}: {e}")
-            try:
-                await ch.set_permissions(
-                    guild.default_role, view_channel=True,
-                    reason="Watchdog unlock fallback",
-                )
-            except Exception:
-                pass
 
-    # Cacher le salon statut (bot online)
     sid = cfg.get("status_channel_id")
-    if sid:
+    if sid and lock_role is not None:
         status_ch = guild.get_channel(int(sid))
         if status_ch is not None:
             try:
                 await status_ch.set_permissions(
-                    guild.default_role, view_channel=False,
+                    lock_role, view_channel=False,
                     reason="Watchdog: hide status (bot online)",
                 )
             except Exception as e:
