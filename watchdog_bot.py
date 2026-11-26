@@ -221,10 +221,11 @@ async def activer_lockdown(guild: discord.Guild, cfg: dict, raison: str) -> bool
                 guild.default_role, view_channel=False,
                 reason=f"Watchdog lockdown: {raison}",
             )
-            if role_booster is not None:
+            # Uniquement sur les salons boosters : deny le rôle booster
+            if ch.id in SALONS_BOOSTERS and role_booster is not None:
                 await ch.set_permissions(
                     role_booster, view_channel=False,
-                    reason=f"Watchdog lockdown: hide booster role",
+                    reason=f"Watchdog lockdown: hide booster channels only",
                 )
         except Exception as e:
             print(f"[WATCHDOG] hide #{getattr(ch, 'name', ch.id)}: {e}")
