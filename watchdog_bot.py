@@ -431,15 +431,19 @@ async def on_ready():
         await client.change_presence(status=discord.Status.offline)
     except Exception:
         pass
-    # Enregistre les commandes slash sur chaque serveur + globalement
+    # Sync UNIQUEMENT par serveur (évite les commandes en double global+guild)
     try:
-        synced_global = await tree.sync()
-        print(f"[WATCHDOG] {len(synced_global)} commande(s) globale(s) synchronisée(s)")
+        # Efface d'éventuelles commandes globales (source des doublons)
+        tree.clear_commands(guild=None)
+        await tree.sync()  # push la liste vide en global
+        print("[WATCHDOG] Commandes globales effacées (anti-doublon)")
     except Exception as e:
-        print(f"[WATCHDOG] sync global: {e}")
+        print(f"[WATCHDOG] clear global: {e}")
     for g in client.guilds:
         try:
-            tree.copy_global_to(guild=g)
+            # Réinjecte les commandes du code sur ce serveur uniquement
+            for cmd in list(tree.get_commands()):
+                tree.add_command(cmd, guild=g, override=True)
             synced = await tree.sync(guild=g)
             print(f"[WATCHDOG] {len(synced)} commande(s) sur {g.name}: {[c.name for c in synced]}")
         except Exception as e:
